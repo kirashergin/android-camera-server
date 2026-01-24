@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.CameraServer" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">#00D4FF</item>
+        <item name="colorPrimaryDark">#0099CC</item>
+        <item name="colorAccent">#00D26A</item>
+        <item name="android:statusBarColor">#1a1a1a</item>
+        <item name="android:navigationBarColor">#1a1a1a</item>
+    </style>
+</resources>
