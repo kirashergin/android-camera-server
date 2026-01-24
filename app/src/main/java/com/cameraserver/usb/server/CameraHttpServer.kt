@@ -83,6 +83,10 @@ class CameraHttpServer(
 
         return try {
             when {
+                // Web UI
+                uri == "/" && method == Method.GET -> handleWebUI()
+                uri == "/settings" && method == Method.GET -> handleWebUI()
+
                 // Health check
                 uri == "/health" && method == Method.GET -> handleHealth()
 
@@ -127,6 +131,236 @@ class CameraHttpServer(
             Log.e(TAG, "Error handling $method $uri: ${e.message}")
             createErrorResponse(e.message ?: "Unknown error")
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // WEB UI
+    // ═══════════════════════════════════════════════════════════════════
+
+    private fun handleWebUI(): Response {
+        val html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camera Server</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        h1 { text-align: center; margin-bottom: 20px; color: #4ecca3; }
+        .grid { display: grid; grid-template-columns: 1fr 350px; gap: 20px; }
+        @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+        .card { background: #16213e; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+        .card h2 { color: #4ecca3; margin-bottom: 15px; font-size: 1.1em; border-bottom: 1px solid #4ecca3; padding-bottom: 8px; }
+        .video-container { position: relative; background: #000; border-radius: 8px; overflow: hidden; }
+        .video-container img { width: 100%; display: block; }
+        .video-placeholder { aspect-ratio: 16/9; display: flex; align-items: center; justify-content: center; color: #666; }
+        .status-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #2a2a4a; }
+        .status-row:last-child { border-bottom: none; }
+        .status-label { color: #888; }
+        .status-value { font-weight: 500; }
+        .status-value.active { color: #4ecca3; }
+        .status-value.inactive { color: #e94560; }
+        .btn-group { display: flex; gap: 10px; margin-top: 15px; flex-wrap: wrap; }
+        .btn { flex: 1; min-width: 80px; padding: 12px 16px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary { background: #4ecca3; color: #1a1a2e; }
+        .btn-primary:hover:not(:disabled) { background: #3db892; }
+        .btn-danger { background: #e94560; color: #fff; }
+        .btn-danger:hover:not(:disabled) { background: #d63850; }
+        .btn-secondary { background: #2a2a4a; color: #eee; }
+        .btn-secondary:hover:not(:disabled) { background: #3a3a5a; }
+        .btn-secondary.active { background: #4ecca3; color: #1a1a2e; }
+        .quality-btns { display: flex; gap: 8px; }
+        .quality-btns .btn { flex: 1; padding: 10px; }
+        select { width: 100%; padding: 10px; border-radius: 8px; border: none; background: #2a2a4a; color: #eee; font-size: 14px; margin-top: 10px; }
+        .photo-preview { margin-top: 15px; }
+        .photo-preview img { max-width: 100%; border-radius: 8px; }
+        .toast { position: fixed; bottom: 20px; right: 20px; padding: 12px 24px; border-radius: 8px; background: #4ecca3; color: #1a1a2e; font-weight: 500; opacity: 0; transition: opacity 0.3s; }
+        .toast.show { opacity: 1; }
+        .toast.error { background: #e94560; color: #fff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📷 Camera Server</h1>
+        <div class="grid">
+            <div class="main">
+                <div class="card">
+                    <h2>Live Stream</h2>
+                    <div class="video-container">
+                        <div id="videoPlaceholder" class="video-placeholder">Click "Start Stream" to begin</div>
+                        <img id="videoStream" style="display:none" />
+                    </div>
+                    <div class="btn-group">
+                        <button class="btn btn-primary" id="btnStart" onclick="startStream()">▶ Start Stream</button>
+                        <button class="btn btn-danger" id="btnStop" onclick="stopStream()" disabled>⏹ Stop Stream</button>
+                    </div>
+                </div>
+                <div class="card">
+                    <h2>Quality</h2>
+                    <div class="quality-btns">
+                        <button class="btn btn-secondary" data-quality="LOW" onclick="setQuality('LOW')">LOW<br><small>720p 30fps</small></button>
+                        <button class="btn btn-secondary active" data-quality="MEDIUM" onclick="setQuality('MEDIUM')">MEDIUM<br><small>1080p 30fps</small></button>
+                        <button class="btn btn-secondary" data-quality="HIGH" onclick="setQuality('HIGH')">HIGH<br><small>1080p 60fps</small></button>
+                    </div>
+                </div>
+                <div class="card">
+                    <h2>Photo Capture</h2>
+                    <div class="btn-group">
+                        <button class="btn btn-primary" onclick="takePhoto('quick')">📸 Quick Photo</button>
+                        <button class="btn btn-secondary" onclick="takePhoto('full')">📷 Full Resolution</button>
+                    </div>
+                    <div class="photo-preview" id="photoPreview"></div>
+                </div>
+            </div>
+            <div class="sidebar">
+                <div class="card">
+                    <h2>Status</h2>
+                    <div id="statusContainer">
+                        <div class="status-row"><span class="status-label">Camera</span><span class="status-value" id="statusCamera">-</span></div>
+                        <div class="status-row"><span class="status-label">Streaming</span><span class="status-value" id="statusStream">-</span></div>
+                        <div class="status-row"><span class="status-label">Resolution</span><span class="status-value" id="statusRes">-</span></div>
+                        <div class="status-row"><span class="status-label">FPS</span><span class="status-value" id="statusFps">-</span></div>
+                        <div class="status-row"><span class="status-label">Clients</span><span class="status-value" id="statusClients">-</span></div>
+                        <div class="status-row"><span class="status-label">Device Tier</span><span class="status-value" id="statusTier">-</span></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h2>Focus</h2>
+                    <select id="focusMode" onchange="setFocusMode(this.value)">
+                        <option value="CONTINUOUS">Continuous</option>
+                        <option value="AUTO">Auto (single)</option>
+                        <option value="MANUAL">Manual</option>
+                        <option value="FIXED">Fixed</option>
+                        <option value="MACRO">Macro</option>
+                    </select>
+                    <div class="btn-group">
+                        <button class="btn btn-secondary" onclick="triggerFocus()">🎯 Focus Now</button>
+                    </div>
+                </div>
+                <div class="card">
+                    <h2>API Endpoints</h2>
+                    <div style="font-size: 12px; color: #888; line-height: 1.8;">
+                        <div><code>GET /stream/mjpeg</code></div>
+                        <div><code>POST /stream/start|stop</code></div>
+                        <div><code>POST /photo</code></div>
+                        <div><code>POST /photo/quick</code></div>
+                        <div><code>GET|POST /stream/quality</code></div>
+                        <div><code>GET|POST /focus/mode</code></div>
+                        <div><code>GET /status</code></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="toast" id="toast"></div>
+    <script>
+        const API = '';
+        let statusInterval;
+
+        async function api(endpoint, method = 'GET', body = null) {
+            const opts = { method };
+            if (body) { opts.headers = {'Content-Type': 'application/json'}; opts.body = JSON.stringify(body); }
+            const res = await fetch(API + endpoint, opts);
+            return res.headers.get('content-type')?.includes('json') ? res.json() : res.blob();
+        }
+
+        function toast(msg, isError = false) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = 'toast show' + (isError ? ' error' : '');
+            setTimeout(() => t.className = 'toast', 2000);
+        }
+
+        async function updateStatus() {
+            try {
+                const s = await api('/status');
+                document.getElementById('statusCamera').textContent = s.camera.isOpen ? 'Open' : 'Closed';
+                document.getElementById('statusCamera').className = 'status-value ' + (s.camera.isOpen ? 'active' : 'inactive');
+                document.getElementById('statusStream').textContent = s.camera.isStreaming ? 'Active' : 'Stopped';
+                document.getElementById('statusStream').className = 'status-value ' + (s.camera.isStreaming ? 'active' : 'inactive');
+                document.getElementById('statusRes').textContent = s.camera.streamResolution;
+                document.getElementById('statusFps').textContent = s.camera.targetFps;
+                document.getElementById('statusClients').textContent = s.server.activeClients;
+                document.getElementById('statusTier').textContent = s.device.tier;
+
+                document.querySelectorAll('.quality-btns .btn').forEach(b => {
+                    b.classList.toggle('active', b.dataset.quality === s.camera.quality);
+                });
+            } catch (e) { console.error('Status error:', e); }
+        }
+
+        async function startStream() {
+            try {
+                await api('/stream/start', 'POST');
+                document.getElementById('videoPlaceholder').style.display = 'none';
+                const img = document.getElementById('videoStream');
+                img.src = '/stream/mjpeg?' + Date.now();
+                img.style.display = 'block';
+                document.getElementById('btnStart').disabled = true;
+                document.getElementById('btnStop').disabled = false;
+                toast('Stream started');
+            } catch (e) { toast('Failed to start stream', true); }
+        }
+
+        async function stopStream() {
+            try {
+                await api('/stream/stop', 'POST');
+                document.getElementById('videoStream').style.display = 'none';
+                document.getElementById('videoPlaceholder').style.display = 'flex';
+                document.getElementById('btnStart').disabled = false;
+                document.getElementById('btnStop').disabled = true;
+                toast('Stream stopped');
+            } catch (e) { toast('Failed to stop stream', true); }
+        }
+
+        async function setQuality(q) {
+            try {
+                await api('/stream/quality', 'POST', {quality: q});
+                toast('Quality set to ' + q);
+                setTimeout(() => { if(document.getElementById('videoStream').style.display !== 'none') startStream(); }, 500);
+                updateStatus();
+            } catch (e) { toast('Failed to set quality', true); }
+        }
+
+        async function setFocusMode(mode) {
+            try {
+                await api('/focus/mode', 'POST', {mode});
+                toast('Focus mode: ' + mode);
+            } catch (e) { toast('Failed to set focus', true); }
+        }
+
+        async function triggerFocus() {
+            try {
+                await api('/focus/auto', 'POST');
+                toast('Focus triggered');
+            } catch (e) { toast('Failed to focus', true); }
+        }
+
+        async function takePhoto(type) {
+            try {
+                const blob = await api(type === 'quick' ? '/photo/quick' : '/photo', 'POST');
+                const url = URL.createObjectURL(blob);
+                document.getElementById('photoPreview').innerHTML = '<img src="' + url + '" />';
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'photo_' + Date.now() + '.jpg';
+                a.click();
+                toast('Photo captured (' + (blob.size / 1024).toFixed(0) + ' KB)');
+            } catch (e) { toast('Failed to capture photo', true); }
+        }
+
+        updateStatus();
+        statusInterval = setInterval(updateStatus, 2000);
+    </script>
+</body>
+</html>
+        """.trimIndent()
+
+        return newFixedLengthResponse(Response.Status.OK, "text/html", html)
     }
 
     // ═══════════════════════════════════════════════════════════════════
