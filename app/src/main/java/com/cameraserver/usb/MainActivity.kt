@@ -206,7 +206,7 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             val isRunning = cameraService?.isServerRunning() == true
             val port = cameraService?.getServerPort() ?: CameraService.SERVER_PORT
-            val config = CameraConfig.current
+            val configSummary = CameraConfig.getConfigSummary()
             val batteryOptimized = if (isBatteryOptimizationDisabled()) "✅ OFF" else "⚠️ ON"
 
             // Device Owner статус
@@ -219,12 +219,7 @@ class MainActivity : AppCompatActivity() {
                     ══════ SERVER STATUS ══════
                     Status: ✅ RUNNING
                     Port: $port
-
-                    ══════ STREAM QUALITY ══════
-                    Preset: ${CameraConfig.currentQuality.name}
-                    Resolution: ${config.resolution}
-                    FPS: ${config.fps}
-                    JPEG Quality: ${config.jpegQuality}%
+                    Stream: $configSummary
 
                     ══════ DEVICE OWNER ══════
                     Device Owner: $deviceOwner
@@ -232,15 +227,10 @@ class MainActivity : AppCompatActivity() {
 
                     ══════ RELIABILITY ══════
                     Battery Optimization: $batteryOptimized
-                    Auto-restart: ✅ Enabled
-                    Boot start: ✅ Enabled
-                    Screen lock: ✅ Bypassed
 
                     ══════ API ENDPOINTS ══════
-                    GET  /status
-                    GET  /device-owner
-                    GET  /stream/quality
-                    POST /stream/quality
+                    GET  /status | /stream/config
+                    POST /stream/config
                     POST /stream/start | stop
                     GET  /stream/mjpeg
                     POST /photo | /photo/quick
@@ -256,11 +246,7 @@ class MainActivity : AppCompatActivity() {
                 statusText.text = """
                     ══════ SERVER STATUS ══════
                     Status: ⏹️ STOPPED
-
-                    ══════ STREAM QUALITY ══════
-                    Preset: ${CameraConfig.currentQuality.name}
-                    ${config.description}
-                    Resolution: ${config.resolution}
+                    Config: $configSummary
 
                     ══════ DEVICE OWNER ══════
                     Device Owner: $deviceOwner
@@ -268,8 +254,6 @@ class MainActivity : AppCompatActivity() {
 
                     ══════ RELIABILITY ══════
                     Battery Optimization: $batteryOptimized
-                    Auto-restart: ✅ Enabled
-                    Boot start: ✅ Enabled
 
                     ═══════════════════════════
                     Press START to begin

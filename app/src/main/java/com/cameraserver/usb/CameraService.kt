@@ -334,7 +334,7 @@ class CameraService : Service() {
             Notification.Builder(this)
         }.apply {
             setContentTitle("Camera Server")
-            setContentText("${CameraConfig.CURRENT_QUALITY.name}: ${CameraConfig.current.resolution} @ ${CameraConfig.targetFps}fps")
+            setContentText(CameraConfig.getConfigSummary())
             setSmallIcon(android.R.drawable.ic_menu_camera)
             setContentIntent(openPendingIntent)
             setOngoing(true)
