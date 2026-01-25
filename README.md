@@ -65,6 +65,53 @@ http://<IP-устройства>:8080
 | POST | `/focus/auto` | Триггер автофокуса |
 | GET | `/focus/modes` | Поддерживаемые режимы |
 
+### Device Owner
+| Метод | Endpoint | Описание |
+|-------|----------|----------|
+| GET | `/device-owner` | Статус Device Owner |
+| POST | `/device-owner/reboot` | Перезагрузка устройства |
+
+## Device Owner Mode
+
+Device Owner — специальный режим Android, дающий приложению расширенные права для работы в режиме киоска/фотобудки.
+
+### Преимущества
+- Автозапуск сервиса при загрузке устройства
+- Запуск Foreground Service из фона (без ограничений Android 12+)
+- Возможность перезагрузки устройства через API
+- Защита от остановки пользователем
+
+### Установка Device Owner
+
+**Важно:** Устройство должно быть сброшено до заводских настроек или не иметь привязанных аккаунтов Google.
+
+```bash
+# Установить приложение
+adb install app-release.apk
+
+# Назначить Device Owner
+adb shell dpm set-device-owner com.cameraserver.usb/.admin.DeviceAdminReceiver
+```
+
+### Проверка статуса
+```bash
+curl http://localhost:8080/device-owner
+```
+
+Ответ:
+```json
+{
+  "isDeviceOwner": true,
+  "isDeviceAdmin": true,
+  "canStartFgsFromBackground": true
+}
+```
+
+### Удаление Device Owner
+```bash
+adb shell dpm remove-active-admin com.cameraserver.usb/.admin.DeviceAdminReceiver
+```
+
 ## Примеры использования
 
 ### Запуск стрима
