@@ -41,6 +41,7 @@ class CameraHttpServer(
         return try {
             when {
                 session.uri == "/" || session.uri == "/settings" -> handleWebUI()
+                session.uri == "/favicon.ico" -> handleFavicon()
                 session.uri == "/health" -> handleHealth()
                 session.uri == "/status" -> handleStatus()
                 session.uri == "/stream/start" && session.method == Method.POST -> handleStreamStart()
@@ -60,8 +61,26 @@ class CameraHttpServer(
                 else -> errorResponse("Not Found: ${session.uri}", Response.Status.NOT_FOUND)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error: ${e.message}")
+            Log.e(TAG, "Error handling ${session.uri}: ${e.message}", e)
             errorResponse(e.message ?: "Error")
+        }
+    }
+
+    private fun handleFavicon(): Response {
+        // 1x1 transparent PNG
+        val favicon = byteArrayOf(
+            0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15.toByte(), 0xC4.toByte(),
+            0x89.toByte(), 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41,
+            0x54, 0x78.toByte(), 0x9C.toByte(), 0x63, 0x00, 0x01, 0x00, 0x00,
+            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4.toByte(), 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE.toByte(),
+            0x42, 0x60, 0x82.toByte()
+        )
+        return newFixedLengthResponse(Response.Status.OK, "image/png", ByteArrayInputStream(favicon), favicon.size.toLong()).apply {
+            addHeader("Cache-Control", "max-age=86400")
         }
     }
 
@@ -284,19 +303,31 @@ statusTimer = setInterval(updateStatus, 2000);
     private fun handleHealth() = jsonResponse(JSONObject().put("status", "ok"))
 
     private fun handleStatus(): Response {
-        val s = cameraController.getStatus()
-        return jsonResponse(JSONObject().apply {
-            put("camera", JSONObject().apply {
-                put("isOpen", s.isOpen)
-                put("isStreaming", s.isStreaming)
-                put("streamResolution", s.streamResolution)
-                put("photoResolution", s.photoResolution)
-                put("targetFps", s.targetFps)
-                put("jpegQuality", s.jpegQuality)
-                put("focusMode", s.focusMode)
+        return try {
+            val s = cameraController.getStatus()
+            jsonResponse(JSONObject().apply {
+                put("camera", JSONObject().apply {
+                    put("isOpen", s.isOpen)
+                    put("isStreaming", s.isStreaming)
+                    put("streamResolution", s.streamResolution)
+                    put("photoResolution", s.photoResolution)
+                    put("targetFps", s.targetFps)
+                    put("jpegQuality", s.jpegQuality)
+                    put("focusMode", s.focusMode)
+                })
+                put("server", JSONObject().put("port", port).put("clients", streamClientCount.get()))
             })
-            put("server", JSONObject().put("port", port).put("clients", streamClientCount.get()))
-        })
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting status: ${e.message}", e)
+            jsonResponse(JSONObject().apply {
+                put("camera", JSONObject().apply {
+                    put("isOpen", false)
+                    put("isStreaming", false)
+                    put("error", e.message)
+                })
+                put("server", JSONObject().put("port", port).put("clients", 0))
+            })
+        }
     }
 
     private fun handleGetConfig() = jsonResponse(JSONObject().apply {
@@ -350,67 +381,123 @@ statusTimer = setInterval(updateStatus, 2000);
 
     private fun handleMjpegStream(session: IHTTPSession): Response {
         val clientId = "${session.remoteIpAddress}:${System.currentTimeMillis()}"
+        Log.d(TAG, "MJPEG stream request from $clientId")
+
         val isActive = AtomicBoolean(true)
         activeStreams[clientId] = isActive
-        val frameQueue = ArrayBlockingQueue<ByteArray>(3)
+        val frameQueue = ArrayBlockingQueue<ByteArray>(5)
         clientFrameQueues[clientId] = frameQueue
         streamClientCount.incrementAndGet()
 
         synchronized(streamLock) {
             if (!cameraController.isStreamActive()) {
                 if (!cameraController.startStream(frameDistributor)) {
-                    cleanup(clientId); return errorResponse("Failed to start")
+                    Log.e(TAG, "Failed to start stream for $clientId")
+                    cleanup(clientId)
+                    return errorResponse("Failed to start stream")
                 }
-            } else cameraController.setStreamCallback(frameDistributor)
+            } else {
+                cameraController.setStreamCallback(frameDistributor)
+            }
         }
 
-        val pis = PipedInputStream(262144)
+        val pis = PipedInputStream(524288)
         val pos = PipedOutputStream(pis)
 
         Thread({
+            var framesWritten = 0L
             try {
-                val timeout = 1000L / CameraConfig.targetFps * 3
+                val baseTimeout = 1000L / CameraConfig.targetFps * 5
+                var consecutiveTimeouts = 0
+
                 while (isActive.get()) {
-                    val frame = frameQueue.poll(timeout, TimeUnit.MILLISECONDS) ?: continue
+                    val frame = frameQueue.poll(baseTimeout, TimeUnit.MILLISECONDS)
+
+                    if (frame == null) {
+                        consecutiveTimeouts++
+                        if (consecutiveTimeouts > 10) {
+                            Log.w(TAG, "MJPEG $clientId: Too many timeouts, closing")
+                            break
+                        }
+                        continue
+                    }
+
+                    consecutiveTimeouts = 0
                     watchdog?.reportFrameReceived()
+
                     val header = "--$MJPEG_BOUNDARY\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.size}\r\n\r\n"
-                    pos.write(header.toByteArray()); pos.write(frame); pos.write("\r\n".toByteArray()); pos.flush()
+                    pos.write(header.toByteArray())
+                    pos.write(frame)
+                    pos.write("\r\n".toByteArray())
+                    pos.flush()
+                    framesWritten++
                 }
-            } catch (_: Exception) {
+            } catch (e: java.io.IOException) {
+                Log.d(TAG, "MJPEG $clientId: Client disconnected after $framesWritten frames")
+            } catch (e: Exception) {
+                Log.e(TAG, "MJPEG $clientId: Error after $framesWritten frames: ${e.message}")
             } finally {
+                Log.d(TAG, "MJPEG $clientId: Closing stream, wrote $framesWritten frames")
                 isActive.set(false)
                 cleanup(clientId)
                 runCatching { pos.close() }
+                runCatching { pis.close() }
             }
-        }, "MJPEG-$clientId").apply { priority = Thread.MAX_PRIORITY; start() }
+        }, "MJPEG-$clientId").apply {
+            priority = Thread.MAX_PRIORITY
+            start()
+        }
 
         return newChunkedResponse(Response.Status.OK, "multipart/x-mixed-replace; boundary=$MJPEG_BOUNDARY", pis).apply {
-            addHeader("Cache-Control", "no-cache"); addHeader("Connection", "keep-alive")
+            addHeader("Cache-Control", "no-cache, no-store, must-revalidate")
+            addHeader("Pragma", "no-cache")
+            addHeader("Expires", "0")
+            addHeader("Connection", "keep-alive")
         }
     }
 
     private fun cleanup(clientId: String) {
         clientFrameQueues.remove(clientId)
         activeStreams.remove(clientId)
+        val remaining = streamClientCount.decrementAndGet()
+        Log.d(TAG, "Cleanup $clientId, remaining clients: $remaining")
+
         synchronized(streamLock) {
-            if (streamClientCount.decrementAndGet() == 0 && activeStreams.isEmpty()) {
-                cameraController.stopStream()
-                watchdog?.reportStreamStopped()
+            if (remaining <= 0 && activeStreams.isEmpty()) {
+                Log.d(TAG, "No more clients, keeping stream active for reconnection")
+                // Don't stop stream immediately - allow time for reconnection
             }
         }
     }
 
     private fun handlePhoto(): Response {
-        val data = cameraController.capturePhoto() ?: return errorResponse("Failed")
-        return newFixedLengthResponse(Response.Status.OK, "image/jpeg", ByteArrayInputStream(data), data.size.toLong()).apply {
-            addHeader("Content-Disposition", "attachment; filename=\"photo_${System.currentTimeMillis()}.jpg\"")
+        return try {
+            val data = cameraController.capturePhoto()
+            if (data == null) {
+                Log.w(TAG, "Photo capture returned null (possibly in progress)")
+                return errorResponse("Photo capture failed or already in progress", Response.Status.SERVICE_UNAVAILABLE)
+            }
+            newFixedLengthResponse(Response.Status.OK, "image/jpeg", ByteArrayInputStream(data), data.size.toLong()).apply {
+                addHeader("Content-Disposition", "attachment; filename=\"photo_${System.currentTimeMillis()}.jpg\"")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Photo capture error: ${e.message}", e)
+            errorResponse("Photo capture error: ${e.message}", Response.Status.INTERNAL_ERROR)
         }
     }
 
     private fun handleQuickPhoto(): Response {
-        val data = cameraController.captureQuickPhoto() ?: return errorResponse("No frame")
-        return newFixedLengthResponse(Response.Status.OK, "image/jpeg", ByteArrayInputStream(data), data.size.toLong()).apply {
-            addHeader("Content-Disposition", "attachment; filename=\"quick_${System.currentTimeMillis()}.jpg\"")
+        return try {
+            val data = cameraController.captureQuickPhoto()
+            if (data == null) {
+                return errorResponse("No frame available", Response.Status.SERVICE_UNAVAILABLE)
+            }
+            newFixedLengthResponse(Response.Status.OK, "image/jpeg", ByteArrayInputStream(data), data.size.toLong()).apply {
+                addHeader("Content-Disposition", "attachment; filename=\"quick_${System.currentTimeMillis()}.jpg\"")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Quick photo error: ${e.message}", e)
+            errorResponse("Quick photo error: ${e.message}", Response.Status.INTERNAL_ERROR)
         }
     }
 

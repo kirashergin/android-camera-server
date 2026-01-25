@@ -45,12 +45,16 @@ class CameraController(private val context: Context) {
     private val isStreaming = AtomicBoolean(false)
     private val isCameraOpen = AtomicBoolean(false)
     private val quickPhotoInProgress = AtomicBoolean(false)
+    private val photoInProgress = AtomicBoolean(false)
+    private val streamOperationLock = Object()
+    private val streamOperationInProgress = AtomicBoolean(false)
 
     private val lastStreamFrame = AtomicReference<ByteArray?>(null)
     private val lastQuickPhotoFrame = AtomicReference<ByteArray?>(null)
     private var streamCallback: ((ByteArray) -> Unit)? = null
 
     private var photoSize: Size = Size(1920, 1080)
+    private var actualStreamSize: Size? = null
     private var quickPhotoSize: Size? = null
     private var cameraCharacteristics: CameraCharacteristics? = null
     private var sensorArraySize: Rect? = null
@@ -159,14 +163,58 @@ class CameraController(private val context: Context) {
 
     fun startStream(callback: ((ByteArray) -> Unit)? = null): Boolean {
         if (isStreaming.get()) return true
+
+        // Prevent concurrent stream operations
+        if (!streamOperationInProgress.compareAndSet(false, true)) {
+            Log.w(TAG, "Stream operation already in progress")
+            return false
+        }
+
+        try {
+            return startStreamInternal(callback)
+        } finally {
+            streamOperationInProgress.set(false)
+        }
+    }
+
+    private fun startStreamInternal(callback: ((ByteArray) -> Unit)?): Boolean {
+        if (isStreaming.get()) return true
         if (!openCamera()) return false
         streamCallback = callback
 
-        val width = CameraConfig.streamWidth
-        val height = CameraConfig.streamHeight
+        val requestedWidth = CameraConfig.streamWidth
+        val requestedHeight = CameraConfig.streamHeight
         val fps = CameraConfig.targetFps
         val quality = CameraConfig.jpegQuality
         val buffers = CameraConfig.bufferCount.coerceAtLeast(4)
+
+        // Find supported size closest to requested
+        val cameraId = currentCameraId ?: return false
+        val map = cameraManager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val supportedSizes = map?.getOutputSizes(ImageFormat.JPEG) ?: emptyArray()
+
+        val selectedSize = supportedSizes.minByOrNull {
+            kotlin.math.abs(it.width - requestedWidth) + kotlin.math.abs(it.height - requestedHeight)
+        } ?: Size(requestedWidth, requestedHeight)
+
+        val width = selectedSize.width
+        val height = selectedSize.height
+
+        if (width != requestedWidth || height != requestedHeight) {
+            Log.w(TAG, "Requested ${requestedWidth}x${requestedHeight} not supported, using ${width}x${height}")
+        }
+
+        // Find supported FPS range
+        val fpsRanges = cameraCharacteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
+        val selectedFpsRange = fpsRanges
+            .filter { it.upper >= fps }
+            .minByOrNull { it.upper - fps }
+            ?: fpsRanges.maxByOrNull { it.upper }
+            ?: Range(15, 30)
+
+        Log.i(TAG, "Starting stream: ${width}x${height}, FPS range: $selectedFpsRange (requested: $fps)")
+        actualStreamSize = Size(width, height)
 
         streamImageReader = ImageReader.newInstance(width, height, ImageFormat.JPEG, buffers).apply {
             setOnImageAvailableListener({ reader ->
@@ -207,23 +255,47 @@ class CameraController(private val context: Context) {
             @Suppress("DEPRECATION")
             camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
-                    captureSession = session
-                    val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                        addTarget(streamImageReader!!.surface)
-                        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                        applyFocusSettings(this)
-                        set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
-                        set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
-                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
-                        set(CaptureRequest.JPEG_QUALITY, quality.toByte())
-                    }.build()
-                    session.setRepeatingRequest(request, null, backgroundHandler)
-                    isStreaming.set(true)
-                    sessionSuccess.set(true)
-                    Log.i(TAG, "Stream: ${width}x${height}@${fps}fps Q$quality")
-                    sessionLatch.countDown()
+                    try {
+                        synchronized(streamOperationLock) {
+                            // Check if we still want this session
+                            if (captureSession != null && captureSession !== session) {
+                                Log.w(TAG, "Session replaced, closing old one")
+                                session.close()
+                                sessionLatch.countDown()
+                                return
+                            }
+                            captureSession = session
+                            val reader = streamImageReader
+                            if (reader == null) {
+                                Log.w(TAG, "ImageReader closed before session configured")
+                                session.close()
+                                captureSession = null
+                                sessionLatch.countDown()
+                                return
+                            }
+                            val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                addTarget(reader.surface)
+                                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                                applyFocusSettings(this)
+                                set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                                set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+                                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, selectedFpsRange)
+                                set(CaptureRequest.JPEG_QUALITY, quality.toByte())
+                            }.build()
+                            session.setRepeatingRequest(request, null, backgroundHandler)
+                            isStreaming.set(true)
+                            sessionSuccess.set(true)
+                            Log.i(TAG, "Stream: ${width}x${height}@${fps}fps Q$quality")
+                        }
+                    } catch (e: IllegalStateException) {
+                        Log.w(TAG, "Session was closed during configuration: ${e.message}")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error in onConfigured: ${e.message}", e)
+                    } finally {
+                        sessionLatch.countDown()
+                    }
                 }
-                override fun onConfigureFailed(session: CameraCaptureSession) { sessionLatch.countDown() }
+                override fun onConfigureFailed(session: CameraCaptureSession) { Log.e(TAG, "Session configuration failed for ${width}x${height}"); sessionLatch.countDown() }
             }, backgroundHandler)
             sessionLatch.await(3, TimeUnit.SECONDS)
         } catch (e: Exception) {
@@ -256,6 +328,7 @@ class CameraController(private val context: Context) {
         lastStreamFrame.set(null); lastQuickPhotoFrame.set(null)
         streamCallback = null
         isStreaming.set(false); quickPhotoInProgress.set(false)
+        actualStreamSize = null
         synchronized(mirrorLock) { reusableBitmap?.recycle(); reusableBitmap = null }
         closeCamera()
         Log.i(TAG, "Stream stopped")
@@ -267,15 +340,37 @@ class CameraController(private val context: Context) {
 
     fun restartStreamWithNewSettings(): Boolean {
         if (!isStreaming.get()) return true
-        val savedCallback = streamCallback
-        Log.i(TAG, "Restarting stream with new settings")
-        runCatching { captureSession?.stopRepeating() }
-        captureSession?.close(); captureSession = null
-        streamImageReader?.close(); streamImageReader = null
-        quickPhotoImageReader?.close(); quickPhotoImageReader = null
-        isStreaming.set(false); quickPhotoInProgress.set(false)
-        Thread.sleep(100)
-        return startStream(savedCallback)
+
+        // Prevent concurrent stream operations
+        if (!streamOperationInProgress.compareAndSet(false, true)) {
+            Log.w(TAG, "Stream operation already in progress, skipping restart")
+            return true // Return true to indicate "ok, will use current settings"
+        }
+
+        try {
+            val savedCallback = streamCallback
+            Log.i(TAG, "Restarting stream with new settings")
+
+            synchronized(streamOperationLock) {
+                runCatching { captureSession?.stopRepeating() }
+                runCatching { captureSession?.close() }
+                captureSession = null
+                runCatching { streamImageReader?.close() }
+                streamImageReader = null
+                runCatching { quickPhotoImageReader?.close() }
+                quickPhotoImageReader = null
+                isStreaming.set(false)
+                quickPhotoInProgress.set(false)
+            }
+
+            Thread.sleep(200)
+            streamOperationInProgress.set(false) // Release lock before starting
+            return startStream(savedCallback)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error restarting stream: ${e.message}", e)
+            streamOperationInProgress.set(false)
+            return false
+        }
     }
 
     fun captureQuickPhoto(highRes: Boolean = false, timeoutMs: Long = 500): ByteArray? {
@@ -308,18 +403,32 @@ class CameraController(private val context: Context) {
     fun getQuickPhotoResolution(highRes: Boolean): String = if (highRes && quickPhotoSize != null) "${quickPhotoSize!!.width}x${quickPhotoSize!!.height}" else "${CameraConfig.streamWidth}x${CameraConfig.streamHeight}"
 
     fun capturePhoto(): ByteArray? {
+        // Prevent concurrent photo captures
+        if (!photoInProgress.compareAndSet(false, true)) {
+            Log.w(TAG, "Photo capture already in progress, ignoring")
+            return null
+        }
+
         val wasStreaming = isStreaming.get()
         val savedCallback = streamCallback
 
         try {
             if (wasStreaming) {
-                captureSession?.stopRepeating(); captureSession?.close(); captureSession = null
-                streamImageReader?.close(); streamImageReader = null
-                photoImageReader?.close(); photoImageReader = null
+                runCatching { captureSession?.stopRepeating() }
+                runCatching { captureSession?.close() }
+                captureSession = null
+                runCatching { streamImageReader?.close() }
+                streamImageReader = null
+                runCatching { photoImageReader?.close() }
+                photoImageReader = null
                 isStreaming.set(false)
+                Thread.sleep(100) // Give camera time to release resources
             }
-            if (!isCameraOpen.get() && !openCamera()) return null
-            val camera = cameraDevice ?: return null
+            if (!isCameraOpen.get() && !openCamera()) {
+                photoInProgress.set(false)
+                return null
+            }
+            val camera = cameraDevice ?: run { photoInProgress.set(false); return null }
 
             photoImageReader = ImageReader.newInstance(photoSize.width, photoSize.height, ImageFormat.JPEG, 2)
             val photoResult = AtomicReference<ByteArray?>(null)
@@ -343,7 +452,14 @@ class CameraController(private val context: Context) {
                 override fun onConfigureFailed(session: CameraCaptureSession) { sessionLatch.countDown(); captureLatch.countDown() }
             }, backgroundHandler)
 
-            if (!sessionLatch.await(3, TimeUnit.SECONDS) || photoSession == null) return null
+            if (!sessionLatch.await(3, TimeUnit.SECONDS) || photoSession == null) {
+                Log.w(TAG, "Photo session creation timeout")
+                runCatching { photoImageReader?.close() }
+                photoImageReader = null
+                photoInProgress.set(false)
+                if (wasStreaming) runCatching { startStream(savedCallback) }
+                return null
+            }
 
             // Pre-capture
             val precaptureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
@@ -375,32 +491,59 @@ class CameraController(private val context: Context) {
                 override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: CaptureFailure) { captureLatch.countDown() }
             }, backgroundHandler)
 
-            if (!captureLatch.await(5, TimeUnit.SECONDS)) return null
-            photoSession?.close(); photoImageReader?.close(); photoImageReader = null
+            if (!captureLatch.await(5, TimeUnit.SECONDS)) {
+                Log.w(TAG, "Photo capture timeout")
+                runCatching { photoSession?.close() }
+                runCatching { photoImageReader?.close() }
+                photoImageReader = null
+                photoInProgress.set(false)
+                if (wasStreaming) runCatching { startStream(savedCallback) }
+                return null
+            }
+            runCatching { photoSession?.close() }
+            runCatching { photoImageReader?.close() }
+            photoImageReader = null
+            photoInProgress.set(false)
             if (wasStreaming) startStream(savedCallback) else closeCamera()
             return photoResult.get()
         } catch (e: Exception) {
-            Log.e(TAG, "Photo failed: ${e.message}")
+            Log.e(TAG, "Photo failed: ${e.message}", e)
             isStreaming.set(false)
+            photoInProgress.set(false)
+            runCatching { photoImageReader?.close() }
+            photoImageReader = null
             if (wasStreaming) runCatching { startStream(savedCallback) }
             return null
         }
     }
 
     private fun applyFocusSettings(builder: CaptureRequest.Builder) {
+        val afMode = when (currentFocusMode) {
+            FocusMode.AUTO -> CaptureRequest.CONTROL_AF_MODE_AUTO
+            FocusMode.CONTINUOUS -> CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+            FocusMode.MANUAL -> if (minFocusDistance > 0) CaptureRequest.CONTROL_AF_MODE_OFF else CaptureRequest.CONTROL_AF_MODE_AUTO
+            FocusMode.FIXED -> CaptureRequest.CONTROL_AF_MODE_OFF
+            FocusMode.MACRO -> CaptureRequest.CONTROL_AF_MODE_MACRO
+        }
+        Log.d(TAG, "Applying AF mode: $afMode for $currentFocusMode")
+        builder.set(CaptureRequest.CONTROL_AF_MODE, afMode)
+
         when (currentFocusMode) {
-            FocusMode.AUTO -> builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-            FocusMode.CONTINUOUS -> builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-            FocusMode.MANUAL -> {
-                if (minFocusDistance > 0) { builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF); builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, manualFocusDistance * minFocusDistance) }
-                else builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-            }
-            FocusMode.FIXED -> { builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF); if (minFocusDistance > 0) builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, minFocusDistance * 0.3f) }
-            FocusMode.MACRO -> builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_MACRO)
+            FocusMode.MANUAL -> if (minFocusDistance > 0) builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, manualFocusDistance * minFocusDistance)
+            FocusMode.FIXED -> if (minFocusDistance > 0) builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, minFocusDistance * 0.3f)
+            else -> {}
         }
     }
 
-    fun setFocusMode(mode: FocusMode): Boolean { currentFocusMode = mode; return if (isStreaming.get()) updateCaptureSettings() else true }
+    fun setFocusMode(mode: FocusMode): Boolean {
+        Log.i(TAG, "Setting focus mode: $mode (was: $currentFocusMode)")
+        currentFocusMode = mode
+        return if (isStreaming.get()) {
+            val result = updateCaptureSettings()
+            Log.i(TAG, "Focus mode update result: $result")
+            result
+        } else true
+    }
     fun setManualFocusDistance(distance: Float): Boolean { manualFocusDistance = distance.coerceIn(0f, 1f); return if (currentFocusMode == FocusMode.MANUAL && isStreaming.get()) updateCaptureSettings() else true }
 
     fun focusOnPoint(x: Float, y: Float): Boolean {
@@ -449,10 +592,11 @@ class CameraController(private val context: Context) {
     }
 
     private fun updateCaptureSettings(): Boolean {
-        val camera = cameraDevice ?: return false
-        val session = captureSession ?: return false
-        val imageReader = streamImageReader ?: return false
+        val camera = cameraDevice ?: run { Log.w(TAG, "updateCaptureSettings: no camera"); return false }
+        val session = captureSession ?: run { Log.w(TAG, "updateCaptureSettings: no session"); return false }
+        val imageReader = streamImageReader ?: run { Log.w(TAG, "updateCaptureSettings: no reader"); return false }
         return runCatching {
+            Log.d(TAG, "Updating capture settings with focus: $currentFocusMode")
             session.setRepeatingRequest(camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                 addTarget(imageReader.surface)
                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
@@ -482,16 +626,20 @@ class CameraController(private val context: Context) {
         }
     }
 
-    fun getStatus() = CameraStatus(
-        isOpen = isCameraOpen.get(),
-        isStreaming = isStreaming.get(),
-        streamResolution = "${CameraConfig.streamWidth}x${CameraConfig.streamHeight}",
-        photoResolution = "${photoSize.width}x${photoSize.height}",
-        targetFps = CameraConfig.targetFps,
-        jpegQuality = CameraConfig.jpegQuality,
-        focusMode = currentFocusMode.name,
-        supportsManualFocus = minFocusDistance > 0
-    )
+    fun getStatus(): CameraStatus {
+        val streamRes = actualStreamSize?.let { "${it.width}x${it.height}" }
+            ?: "${CameraConfig.streamWidth}x${CameraConfig.streamHeight}"
+        return CameraStatus(
+            isOpen = isCameraOpen.get(),
+            isStreaming = isStreaming.get(),
+            streamResolution = streamRes,
+            photoResolution = "${photoSize.width}x${photoSize.height}",
+            targetFps = CameraConfig.targetFps,
+            jpegQuality = CameraConfig.jpegQuality,
+            focusMode = currentFocusMode.name,
+            supportsManualFocus = minFocusDistance > 0
+        )
+    }
 
     fun getSupportedFocusModes(): List<FocusMode> {
         val modes = mutableListOf(FocusMode.AUTO, FocusMode.CONTINUOUS)
