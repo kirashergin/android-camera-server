@@ -12,6 +12,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import com.cameraserver.usb.CameraService
+import com.cameraserver.usb.config.CameraConfig
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -19,100 +20,82 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * Обеспечивает работу сервиса 24/7 через:
  * - Обработку crash с автоматическим перезапуском
- * - Периодическую проверку состояния (каждые 30 сек)
+ * - Периодическую проверку состояния
  * - Эскалирующие стратегии восстановления
  *
- * ## Стратегии восстановления (от мягкой к агрессивной)
- * 1. [RecoveryStrategy.SIMPLE_RESTART] - простой перезапуск сервиса
- * 2. [RecoveryStrategy.DELAYED_RESTART] - перезапуск с задержкой
- * 3. [RecoveryStrategy.CLEAR_STATE_RESTART] - очистка состояния + перезапуск
- * 4. [RecoveryStrategy.FULL_APP_RESTART] - полный перезапуск приложения
+ * Стратегии восстановления (от мягкой к агрессивной):
+ * - SIMPLE_RESTART - простой перезапуск сервиса
+ * - DELAYED_RESTART - перезапуск с задержкой
+ * - CLEAR_STATE_RESTART - очистка состояния + перезапуск
+ * - FULL_APP_RESTART - полный перезапуск приложения
  *
- * ## Особенности Android 14+ (API 34)
  * На Android 14+ сразу используется FULL_APP_RESTART, т.к. FGS с типом camera
- * не может быть запущен из фонового контекста (BroadcastReceiver).
- *
- * @see RecoveryReceiver для обработки recovery
- * @see ServiceCheckReceiver для периодических проверок
+ * не может быть запущен из фонового контекста.
  */
 object ServiceGuard {
 
     private const val TAG = "ServiceGuard"
-    private const val CHECK_INTERVAL_MS = 30_000L
     private const val ALARM_REQUEST_CODE = 12345
 
     private val consecutiveFailures = AtomicInteger(0)
     private val totalRecoveryAttempts = AtomicInteger(0)
 
-    /** Интервалы между попытками (exponential backoff) */
-    private val RETRY_DELAYS = longArrayOf(
-        2_000,    // 2 сек
-        5_000,    // 5 сек
-        10_000,   // 10 сек
-        30_000,   // 30 сек
-        60_000,   // 1 мин
-        120_000,  // 2 мин
-        300_000   // 5 мин (максимум, потом повторяется)
-    )
-
     private val mainHandler = Handler(Looper.getMainLooper())
     private var appContext: Context? = null
 
-    /** Инициализирует защиту сервиса. Вызывается в Application.onCreate */
+    /**
+     * Инициализирует защиту сервиса
+     */
     fun init(context: Context) {
         appContext = context.applicationContext
         setupCrashHandler(context)
         scheduleServiceCheck(context)
         requestBatteryOptimizationExemption(context)
 
-        // Инициализация LogReporter
         LogReporter.init(context)
-
-        LogReporter.info(TAG, "ServiceGuard initialized with infinite retry")
+        LogReporter.info(TAG, "ServiceGuard инициализирован (интервал проверки: ${CameraConfig.SERVICE_CHECK_INTERVAL_MS}мс)")
     }
 
-    /** Устанавливает обработчик crash с отправкой логов и планированием recovery */
+    /**
+     * Устанавливает обработчик crash с отправкой логов и планированием recovery
+     */
     private fun setupCrashHandler(context: Context) {
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
 
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            LogReporter.critical(TAG, "CRASH in thread ${thread.name}: ${throwable.message}", throwable)
-
-            // Планируем бесконечные попытки восстановления
+            LogReporter.critical(TAG, "CRASH в потоке ${thread.name}: ${throwable.message}", throwable)
             scheduleRecoveryChain(context)
-
-            // Вызываем стандартный обработчик
             defaultHandler?.uncaughtException(thread, throwable)
         }
     }
 
-    /** Запускает цепочку восстановления с эскалирующей стратегией */
+    /**
+     * Запускает цепочку восстановления с эскалирующей стратегией
+     */
     fun scheduleRecoveryChain(context: Context) {
         val attempt = totalRecoveryAttempts.incrementAndGet()
         val failures = consecutiveFailures.incrementAndGet()
 
-        // Android 14+: нужен foreground контекст для FGS camera
         val strategy = if (Build.VERSION.SDK_INT >= 34) {
             RecoveryStrategy.FULL_APP_RESTART
         } else {
-            // На более старых версиях используем escalating strategy
             when {
-                failures <= 3 -> RecoveryStrategy.SIMPLE_RESTART
-                failures <= 6 -> RecoveryStrategy.DELAYED_RESTART
-                failures <= 10 -> RecoveryStrategy.CLEAR_STATE_RESTART
+                failures <= CameraConfig.RECOVERY_SIMPLE_RESTART_THRESHOLD -> RecoveryStrategy.SIMPLE_RESTART
+                failures <= CameraConfig.RECOVERY_DELAYED_RESTART_THRESHOLD -> RecoveryStrategy.DELAYED_RESTART
+                failures <= CameraConfig.RECOVERY_CLEAR_STATE_THRESHOLD -> RecoveryStrategy.CLEAR_STATE_RESTART
                 else -> RecoveryStrategy.FULL_APP_RESTART
             }
         }
 
         val delay = if (strategy == RecoveryStrategy.FULL_APP_RESTART) {
-            1_000L
+            CameraConfig.RECOVERY_FULL_RESTART_DELAY_MS
         } else {
-            val delayIndex = (failures - 1).coerceIn(0, RETRY_DELAYS.size - 1)
-            RETRY_DELAYS[delayIndex]
+            val delayIndex = (failures - 1).coerceIn(0, CameraConfig.RECOVERY_RETRY_DELAYS.lastIndex)
+            CameraConfig.RECOVERY_RETRY_DELAYS[delayIndex]
         }
 
-        LogReporter.warn(TAG, "Recovery attempt #$attempt (consecutive: $failures) " +
-                "using ${strategy.name}, delay: ${delay}ms (API ${Build.VERSION.SDK_INT})")
+        LogReporter.warn(TAG, "Восстановление #$attempt (подряд: $failures) " +
+                "стратегия: ${strategy.name}, задержка: ${delay}мс (API ${Build.VERSION.SDK_INT})")
 
         scheduleRecovery(context, delay, strategy)
     }
@@ -147,9 +130,11 @@ object ServiceGuard {
         }
     }
 
-    /** Выполняет восстановление указанной стратегией */
+    /**
+     * Выполняет восстановление указанной стратегией
+     */
     fun executeRecovery(context: Context, strategy: RecoveryStrategy, attempt: Int): Boolean {
-        LogReporter.info(TAG, "Executing recovery #$attempt: ${strategy.name}")
+        LogReporter.info(TAG, "Выполнение восстановления #$attempt: ${strategy.name}")
 
         return try {
             when (strategy) {
@@ -157,14 +142,14 @@ object ServiceGuard {
                     startService(context)
                 }
                 RecoveryStrategy.DELAYED_RESTART -> {
-                    Thread.sleep(1000)
+                    Thread.sleep(CameraConfig.SERVICE_RESTART_DELAY_MS)
                     startService(context)
                 }
                 RecoveryStrategy.CLEAR_STATE_RESTART -> {
-                    try {
+                    runCatching {
                         context.stopService(Intent(context, CameraService::class.java))
-                        Thread.sleep(2000)
-                    } catch (_: Exception) { }
+                        Thread.sleep(CameraConfig.SERVICE_RESTART_DELAY_MS * CameraConfig.RECOVERY_CLEAR_STATE_DELAY_MULTIPLIER)
+                    }
                     startService(context)
                 }
                 RecoveryStrategy.FULL_APP_RESTART -> {
@@ -173,22 +158,24 @@ object ServiceGuard {
                 }
             }
         } catch (e: Exception) {
-            LogReporter.error(TAG, "Recovery ${strategy.name} failed", e)
+            LogReporter.error(TAG, "Восстановление ${strategy.name} не удалось", e)
             false
         }
     }
 
-    /** Сбрасывает счётчик неудач при успешной работе */
+    /**
+     * Сбрасывает счётчик неудач при успешной работе
+     */
     fun reportSuccess() {
         if (consecutiveFailures.get() > 0) {
-            LogReporter.info(TAG, "Service recovered successfully after ${consecutiveFailures.get()} failures")
+            LogReporter.info(TAG, "Сервис восстановлен после ${consecutiveFailures.get()} ошибок")
             consecutiveFailures.set(0)
         }
     }
 
     private fun startService(context: Context): Boolean {
         if (Build.VERSION.SDK_INT >= 34) {
-            LogReporter.warn(TAG, "API 34+: Service start may need Activity context")
+            LogReporter.warn(TAG, "API 34+: Запуск сервиса может потребовать Activity контекст")
         }
 
         val intent = Intent(context, CameraService::class.java).apply {
@@ -200,26 +187,25 @@ object ServiceGuard {
             } else {
                 context.startService(intent)
             }
-            // Проверяем через 3 секунды
-            Thread.sleep(3000)
+            Thread.sleep(CameraConfig.SERVICE_START_VERIFICATION_DELAY_MS)
             val running = isServiceRunning(context)
             if (running) {
                 reportSuccess()
-                LogReporter.info(TAG, "Service started successfully")
+                LogReporter.info(TAG, "Сервис успешно запущен")
             }
             running
         } catch (e: SecurityException) {
-            LogReporter.error(TAG, "SecurityException: Need foreground context for FGS", e)
+            LogReporter.error(TAG, "SecurityException: Нужен foreground контекст для FGS", e)
             restartApp(context)
             true
         } catch (e: Exception) {
-            LogReporter.error(TAG, "Failed to start service", e)
+            LogReporter.error(TAG, "Ошибка запуска сервиса", e)
             false
         }
     }
 
     private fun restartApp(context: Context) {
-        LogReporter.warn(TAG, "Performing full app restart...")
+        LogReporter.warn(TAG, "Полный перезапуск приложения...")
 
         val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
         intent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
@@ -232,15 +218,16 @@ object ServiceGuard {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         alarmManager.set(
             AlarmManager.ELAPSED_REALTIME_WAKEUP,
-            SystemClock.elapsedRealtime() + 1000,
+            SystemClock.elapsedRealtime() + CameraConfig.SERVICE_RESTART_DELAY_MS,
             pendingIntent
         )
 
-        // Завершаем процесс
         android.os.Process.killProcess(android.os.Process.myPid())
     }
 
-    /** Планирует периодическую проверку сервиса через AlarmManager */
+    /**
+     * Планирует периодическую проверку сервиса через AlarmManager
+     */
     fun scheduleServiceCheck(context: Context) {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val intent = Intent(context, ServiceCheckReceiver::class.java)
@@ -253,7 +240,7 @@ object ServiceGuard {
 
         alarmManager.cancel(pendingIntent)
 
-        val triggerTime = SystemClock.elapsedRealtime() + CHECK_INTERVAL_MS
+        val triggerTime = SystemClock.elapsedRealtime() + CameraConfig.SERVICE_CHECK_INTERVAL_MS
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             alarmManager.setExactAndAllowWhileIdle(
@@ -265,7 +252,7 @@ object ServiceGuard {
             alarmManager.setRepeating(
                 AlarmManager.ELAPSED_REALTIME_WAKEUP,
                 triggerTime,
-                CHECK_INTERVAL_MS,
+                CameraConfig.SERVICE_CHECK_INTERVAL_MS,
                 pendingIntent
             )
         }
@@ -281,9 +268,9 @@ object ServiceGuard {
             val packageName = context.packageName
 
             if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
-                LogReporter.warn(TAG, "App is NOT exempt from battery optimization!")
+                LogReporter.warn(TAG, "Приложение НЕ исключено из оптимизации батареи!")
             } else {
-                LogReporter.info(TAG, "App is exempt from battery optimization")
+                LogReporter.info(TAG, "Приложение исключено из оптимизации батареи")
             }
         }
     }
@@ -299,14 +286,15 @@ object ServiceGuard {
         return false
     }
 
-    /** Проверяет сервис и запускает recovery если нужно */
+    /**
+     * Проверяет сервис и запускает recovery если нужно
+     */
     fun ensureServiceRunning(context: Context) {
         if (!isServiceRunning(context)) {
-            LogReporter.warn(TAG, "Service not running, attempting recovery... (API ${Build.VERSION.SDK_INT})")
+            LogReporter.warn(TAG, "Сервис не запущен, запуск восстановления... (API ${Build.VERSION.SDK_INT})")
             scheduleRecoveryChain(context)
         } else {
             reportSuccess()
-            // Отправляем heartbeat
             LogReporter.sendHeartbeat("running", mapOf(
                 "uptime" to SystemClock.elapsedRealtime(),
                 "recoveryAttempts" to totalRecoveryAttempts.get()
@@ -314,9 +302,11 @@ object ServiceGuard {
         }
     }
 
-    /** Запускает сервис из Activity контекста (для Android 14+) */
+    /**
+     * Запускает сервис из Activity контекста (для Android 14+)
+     */
     fun startServiceFromActivity(context: Context): Boolean {
-        LogReporter.info(TAG, "Starting service from Activity context (API ${Build.VERSION.SDK_INT})")
+        LogReporter.info(TAG, "Запуск сервиса из Activity контекста (API ${Build.VERSION.SDK_INT})")
         return startService(context)
     }
 
@@ -326,6 +316,9 @@ object ServiceGuard {
     )
 }
 
+/**
+ * Стратегии восстановления сервиса
+ */
 enum class RecoveryStrategy {
     SIMPLE_RESTART,
     DELAYED_RESTART,
@@ -333,47 +326,48 @@ enum class RecoveryStrategy {
     FULL_APP_RESTART
 }
 
-/** Периодическая проверка сервиса (каждые 30 сек) */
+/**
+ * Периодическая проверка состояния сервиса
+ */
 class ServiceCheckReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        Log.d("ServiceCheckReceiver", "Checking service status...")
+        Log.d("ServiceCheckReceiver", "Проверка состояния сервиса...")
         ServiceGuard.ensureServiceRunning(context)
         ServiceGuard.scheduleServiceCheck(context)
     }
 }
 
-/** Перезапуск сервиса после crash */
+/**
+ * Перезапуск сервиса после crash
+ */
 class ServiceRestartReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        Log.i("ServiceRestartReceiver", "Restarting service after crash...")
+        Log.i("ServiceRestartReceiver", "Перезапуск сервиса после crash...")
         ServiceGuard.ensureServiceRunning(context)
     }
 }
 
-/** Выполняет стратегии восстановления */
+/**
+ * Выполняет стратегии восстановления
+ */
 class RecoveryReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val strategyName = intent.getStringExtra("strategy") ?: "SIMPLE_RESTART"
         val attempt = intent.getIntExtra("attempt", 0)
 
-        val strategy = try {
-            RecoveryStrategy.valueOf(strategyName)
-        } catch (e: Exception) {
-            RecoveryStrategy.SIMPLE_RESTART
-        }
+        val strategy = runCatching { RecoveryStrategy.valueOf(strategyName) }
+            .getOrDefault(RecoveryStrategy.SIMPLE_RESTART)
 
-        Log.i("RecoveryReceiver", "Executing recovery #$attempt: $strategyName")
+        Log.i("RecoveryReceiver", "Выполнение восстановления #$attempt: $strategyName")
 
-        // Выполняем в отдельном потоке чтобы не блокировать BroadcastReceiver
         Thread {
             val success = ServiceGuard.executeRecovery(context, strategy, attempt)
 
             if (!success) {
-                // Если не удалось - планируем следующую попытку
-                Log.w("RecoveryReceiver", "Recovery failed, scheduling next attempt...")
+                Log.w("RecoveryReceiver", "Восстановление не удалось, планирование следующей попытки...")
                 ServiceGuard.scheduleRecoveryChain(context)
             } else {
-                LogReporter.info("RecoveryReceiver", "Recovery successful!")
+                LogReporter.info("RecoveryReceiver", "Восстановление успешно!")
             }
         }.start()
     }

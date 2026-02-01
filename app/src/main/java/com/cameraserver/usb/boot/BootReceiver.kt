@@ -12,8 +12,14 @@ import com.cameraserver.usb.reliability.LogReporter
 /**
  * Автозапуск сервиса при загрузке устройства
  *
+ * Поведение:
  * - Device Owner: запускает FGS напрямую
  * - Без Device Owner на Android 14+: запускает MainActivity
+ *
+ * Обрабатываемые события:
+ * - ACTION_BOOT_COMPLETED
+ * - ACTION_LOCKED_BOOT_COMPLETED
+ * - Vendor-specific quickboot events
  */
 class BootReceiver : BroadcastReceiver() {
 
@@ -23,8 +29,8 @@ class BootReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action
-        Log.i(TAG, "Received: $action")
-        LogReporter.info(TAG, "Boot event: $action")
+        Log.i(TAG, "Получено: $action")
+        LogReporter.info(TAG, "Событие загрузки: $action")
 
         when (action) {
             Intent.ACTION_BOOT_COMPLETED,
@@ -36,20 +42,26 @@ class BootReceiver : BroadcastReceiver() {
         }
     }
 
+    /**
+     * Запускает сервис камеры в зависимости от возможностей
+     */
     private fun startCameraService(context: Context) {
         val isDeviceOwner = DeviceOwnerManager.isDeviceOwner(context)
         val canStartFromBackground = DeviceOwnerManager.canStartForegroundServiceFromBackground(context)
 
-        LogReporter.info(TAG, "Starting CameraService (DeviceOwner: $isDeviceOwner, API: ${Build.VERSION.SDK_INT})")
+        LogReporter.info(TAG, "Запуск CameraService (DeviceOwner: $isDeviceOwner, API: ${Build.VERSION.SDK_INT})")
 
         if (canStartFromBackground) {
             startServiceDirectly(context)
         } else {
-            LogReporter.warn(TAG, "Cannot start FGS from background, launching Activity")
+            LogReporter.warn(TAG, "Нельзя запустить FGS из фона, запускаем Activity")
             launchMainActivity(context)
         }
     }
 
+    /**
+     * Прямой запуск сервиса (для Device Owner или API < 34)
+     */
     private fun startServiceDirectly(context: Context) {
         val serviceIntent = Intent(context, CameraService::class.java).apply {
             action = CameraService.ACTION_START
@@ -61,24 +73,27 @@ class BootReceiver : BroadcastReceiver() {
             } else {
                 context.startService(serviceIntent)
             }
-            LogReporter.info(TAG, "CameraService start requested directly")
+            LogReporter.info(TAG, "CameraService запущен напрямую")
         } catch (e: Exception) {
-            LogReporter.error(TAG, "Failed to start service directly, trying Activity", e)
+            LogReporter.error(TAG, "Ошибка прямого запуска, пробуем Activity", e)
             launchMainActivity(context)
         }
     }
 
+    /**
+     * Запуск через MainActivity (для Android 14+ без Device Owner)
+     */
     private fun launchMainActivity(context: Context) {
-        try {
+        runCatching {
             val activityIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
             activityIntent?.apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
             }
             context.startActivity(activityIntent)
-            LogReporter.info(TAG, "MainActivity launched for service start")
-        } catch (e: Exception) {
-            LogReporter.error(TAG, "Failed to launch Activity", e)
+            LogReporter.info(TAG, "MainActivity запущен для старта сервиса")
+        }.onFailure {
+            LogReporter.error(TAG, "Ошибка запуска Activity", it)
         }
     }
 }

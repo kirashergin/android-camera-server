@@ -22,24 +22,18 @@ import com.cameraserver.usb.reliability.SystemWatchdog
 import com.cameraserver.usb.server.CameraHttpServer
 
 /**
- * Foreground Service для работы камеры в режиме фотобудки
+ * Foreground Service для работы камеры
  *
- * Это основной компонент приложения, обеспечивающий:
- * - Работу HTTP сервера для управления камерой
- * - Удержание Wake Lock для предотвращения засыпания
- * - Мониторинг здоровья системы (температура, память)
+ * Основной компонент приложения, обеспечивающий:
+ * - HTTP сервер для управления камерой
+ * - Wake Lock для предотвращения засыпания
+ * - Мониторинг здоровья системы
  * - Автоматическое восстановление при сбоях
  *
- * ## Компоненты надёжности
- * - [SystemWatchdog] - отслеживает зависания стрима и сервера
- * - [CameraRecoveryManager] - мягкое восстановление камеры
- * - [DeviceHealthMonitor] - мониторинг температуры и батареи
- *
- * ## Жизненный цикл
- * Сервис запускается через [ACTION_START] и работает до явной остановки
- * через [ACTION_STOP] или убийства системой (в этом случае перезапустится).
- *
- * @see ServiceGuard для защиты от остановки
+ * Компоненты надёжности:
+ * - SystemWatchdog - отслеживает зависания
+ * - CameraRecoveryManager - мягкое восстановление камеры
+ * - DeviceHealthMonitor - мониторинг температуры и батареи
  */
 class CameraService : Service() {
 
@@ -47,8 +41,7 @@ class CameraService : Service() {
         private const val TAG = "CameraService"
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "camera_service_channel"
-        val SERVER_PORT = CameraConfig.SERVER_PORT
-        
+
         const val ACTION_START = "com.cameraserver.usb.START"
         const val ACTION_STOP = "com.cameraserver.usb.STOP"
     }
@@ -57,12 +50,12 @@ class CameraService : Service() {
     private var httpServer: CameraHttpServer? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
-    // Компоненты надёжности
     private var watchdog: SystemWatchdog? = null
     private var recoveryManager: CameraRecoveryManager? = null
     private var healthMonitor: DeviceHealthMonitor? = null
 
     private val binder = LocalBinder()
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     inner class LocalBinder : Binder() {
         fun getService(): CameraService = this@CameraService
@@ -70,7 +63,7 @@ class CameraService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        Log.i(TAG, "Service created")
+        Log.i(TAG, "Сервис создан")
         createNotificationChannel()
     }
 
@@ -80,13 +73,14 @@ class CameraService : Service() {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            else -> {
-                startForegroundService()
-            }
+            else -> startForegroundService()
         }
-        return START_STICKY // Автоперезапуск при убийстве системой
+        return START_STICKY
     }
 
+    /**
+     * Запускает foreground сервис со всеми компонентами
+     */
     private fun startForegroundService() {
         val notification = createNotification()
 
@@ -102,9 +96,12 @@ class CameraService : Service() {
         startHttpServer()
         initializeReliabilitySystems()
 
-        Log.i(TAG, "Foreground service started on port $SERVER_PORT")
+        Log.i(TAG, "Сервис запущен на порту ${CameraConfig.SERVER_PORT}")
     }
 
+    /**
+     * Инициализирует контроллер камеры
+     */
     private fun initializeCamera() {
         if (cameraController == null) {
             cameraController = CameraController(applicationContext)
@@ -112,37 +109,44 @@ class CameraService : Service() {
         }
     }
 
+    /**
+     * Запускает HTTP сервер
+     */
     private fun startHttpServer() {
         if (httpServer == null && cameraController != null) {
-            httpServer = CameraHttpServer(this, SERVER_PORT, cameraController!!, watchdog)
-            try {
+            httpServer = CameraHttpServer(this, CameraConfig.SERVER_PORT, cameraController!!, watchdog)
+            runCatching {
                 httpServer?.start()
-                Log.i(TAG, "HTTP server started on port $SERVER_PORT")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start HTTP server", e)
+                Log.i(TAG, "HTTP сервер запущен на порту ${CameraConfig.SERVER_PORT}")
+            }.onFailure {
+                Log.e(TAG, "Ошибка запуска HTTP сервера", it)
             }
         }
     }
-    
+
+    /**
+     * Инициализирует watchdog
+     */
     private fun initializeWatchdog() {
         if (watchdog != null) return
-
         watchdog = SystemWatchdog(applicationContext)
-        // Запуск watchdog отложим до initializeReliabilitySystems
     }
 
+    /**
+     * Инициализирует системы надёжности
+     */
     private fun initializeReliabilitySystems() {
         val camera = cameraController ?: return
 
         recoveryManager = CameraRecoveryManager(camera).apply {
             setCallbacks(
-                onStarted = { Log.i(TAG, "Recovery started") },
+                onStarted = { Log.i(TAG, "Восстановление запущено") },
                 onSuccess = {
-                    Log.i(TAG, "Recovery successful")
+                    Log.i(TAG, "Восстановление успешно")
                     watchdog?.resetTimestamps()
                 },
                 onFailed = {
-                    Log.e(TAG, "Recovery failed, will restart service")
+                    Log.e(TAG, "Восстановление не удалось, перезапуск сервиса")
                     restartService()
                 }
             )
@@ -151,109 +155,118 @@ class CameraService : Service() {
         healthMonitor = DeviceHealthMonitor(applicationContext).apply {
             startMonitoring(
                 onTemperatureWarning = { temp, level ->
-                    Log.w(TAG, "Temperature: ${temp/10.0}°C ($level)")
+                    Log.w(TAG, "Температура: ${temp / 10.0}°C ($level)")
                     if (level == DeviceHealthMonitor.TemperatureLevel.CRITICAL) {
-                        Log.e(TAG, "Critical temperature!")
+                        Log.e(TAG, "Критическая температура!")
                     }
                 },
                 onBatteryLow = { level ->
-                    Log.w(TAG, "Battery low: $level%")
+                    Log.w(TAG, "Низкий заряд: $level%")
                 }
             )
         }
 
         watchdog?.start(
             onStreamStuck = {
-                Log.w(TAG, "Watchdog: Stream stuck, attempting recovery")
+                Log.w(TAG, "Watchdog: Стрим завис, восстановление")
                 recoveryManager?.recoverStream()
             },
             onServerStuck = {
-                Log.w(TAG, "Watchdog: Server stuck, restarting")
+                Log.w(TAG, "Watchdog: Сервер завис, перезапуск")
                 restartHttpServer()
             },
             onCriticalError = {
-                Log.e(TAG, "Watchdog: Critical error, full restart")
+                Log.e(TAG, "Watchdog: Критическая ошибка, полный перезапуск")
                 restartService()
             },
             onMemoryWarning = { usage ->
-                Log.w(TAG, "Memory usage: ${(usage * 100).toInt()}%")
+                Log.w(TAG, "Память: ${(usage * 100).toInt()}%")
             }
         )
 
-        Log.i(TAG, "Reliability systems initialized")
+        Log.i(TAG, "Системы надёжности инициализированы")
     }
-    
-    private val mainHandler = Handler(Looper.getMainLooper())
 
+    /**
+     * Перезапускает HTTP сервер
+     */
     private fun restartHttpServer() {
         Thread {
-            try {
+            runCatching {
                 val oldServer = httpServer
                 httpServer = null
                 oldServer?.stop()
-                Thread.sleep(500)
+                Thread.sleep(CameraConfig.HTTP_SERVER_RESTART_DELAY_MS)
                 mainHandler.post {
                     if (httpServer == null) {
                         startHttpServer()
                     }
                     watchdog?.resetTimestamps()
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to restart HTTP server", e)
+            }.onFailure {
+                Log.e(TAG, "Ошибка перезапуска HTTP сервера", it)
             }
         }.start()
     }
-    
+
+    /**
+     * Перезапускает весь сервис
+     */
     private fun restartService() {
-        Log.w(TAG, "Restarting service...")
+        Log.w(TAG, "Перезапуск сервиса...")
 
         Thread {
-            try {
+            runCatching {
                 stopReliabilitySystems()
                 httpServer?.stop()
                 httpServer = null
                 cameraController?.release()
                 cameraController = null
 
-                Thread.sleep(1000)
+                Thread.sleep(CameraConfig.SERVICE_RESTART_DELAY_MS)
 
                 mainHandler.post {
                     val restartIntent = Intent(applicationContext, CameraService::class.java).apply {
                         action = ACTION_START
                     }
-                    
+
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         startForegroundService(restartIntent)
                     } else {
                         startService(restartIntent)
                     }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to restart service", e)
+            }.onFailure {
+                Log.e(TAG, "Ошибка перезапуска сервиса", it)
             }
         }.start()
     }
-    
+
+    /**
+     * Останавливает системы надёжности
+     */
     private fun stopReliabilitySystems() {
         watchdog?.stop()
         watchdog = null
-        
+
         recoveryManager?.shutdown()
         recoveryManager = null
-        
+
         healthMonitor?.stopMonitoring()
         healthMonitor = null
     }
 
-    private val WAKELOCK_TIMEOUT_MS = 10 * 60 * 1000L // 10 минут
-    
+    // ══════════════════════════════════════════════════════════════════
+    // WAKE LOCK
+    // ══════════════════════════════════════════════════════════════════
+
     private val wakeLockRenewRunnable = object : Runnable {
         override fun run() {
             renewWakeLock()
-            mainHandler.postDelayed(this, WAKELOCK_TIMEOUT_MS - 60000) // Обновляем за минуту до истечения
+            mainHandler.postDelayed(this, CameraConfig.WAKELOCK_RENEW_INTERVAL_MS)
         }
     }
-    
+
     private fun acquireWakeLock() {
         if (wakeLock == null) {
             val powerManager = getSystemService(POWER_SERVICE) as PowerManager
@@ -262,26 +275,25 @@ class CameraService : Service() {
                 "CameraServer::WakeLock"
             )
         }
-        
+
         wakeLock?.let {
             if (!it.isHeld) {
-                it.acquire(WAKELOCK_TIMEOUT_MS)
-                Log.i(TAG, "Wake lock acquired with timeout")
+                it.acquire(CameraConfig.WAKELOCK_TIMEOUT_MS)
+                Log.i(TAG, "Wake lock получен")
             }
         }
-        
-        // Запускаем периодическое обновление
+
         mainHandler.removeCallbacks(wakeLockRenewRunnable)
-        mainHandler.postDelayed(wakeLockRenewRunnable, WAKELOCK_TIMEOUT_MS - 60000)
+        mainHandler.postDelayed(wakeLockRenewRunnable, CameraConfig.WAKELOCK_RENEW_INTERVAL_MS)
     }
-    
+
     private fun renewWakeLock() {
         wakeLock?.let {
             if (it.isHeld) {
                 it.release()
             }
-            it.acquire(WAKELOCK_TIMEOUT_MS)
-            Log.d(TAG, "Wake lock renewed")
+            it.acquire(CameraConfig.WAKELOCK_TIMEOUT_MS)
+            Log.d(TAG, "Wake lock обновлён")
         }
     }
 
@@ -290,11 +302,15 @@ class CameraService : Service() {
         wakeLock?.let {
             if (it.isHeld) {
                 it.release()
-                Log.i(TAG, "Wake lock released")
+                Log.i(TAG, "Wake lock освобождён")
             }
         }
         wakeLock = null
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // УВЕДОМЛЕНИЯ
+    // ══════════════════════════════════════════════════════════════════
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -303,10 +319,10 @@ class CameraService : Service() {
                 "Camera Server",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Camera server is running"
+                description = "Сервер камеры работает"
                 setShowBadge(false)
             }
-            
+
             val notificationManager = getSystemService(NotificationManager::class.java)
             notificationManager.createNotificationChannel(channel)
         }
@@ -338,51 +354,36 @@ class CameraService : Service() {
             setSmallIcon(android.R.drawable.ic_menu_camera)
             setContentIntent(openPendingIntent)
             setOngoing(true)
-            addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                "Stop",
-                stopPendingIntent
-            )
+            addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
         }.build()
     }
 
-    override fun onBind(intent: Intent?): IBinder {
-        return binder
-    }
+    override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
-        Log.i(TAG, "Service destroying")
-        
+        Log.i(TAG, "Сервис завершается")
+
         stopReliabilitySystems()
-        
+
         httpServer?.stop()
         httpServer = null
-        
+
         cameraController?.release()
         cameraController = null
-        
+
         releaseWakeLock()
-        
+
         super.onDestroy()
-        Log.i(TAG, "Service destroyed")
+        Log.i(TAG, "Сервис завершён")
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // PUBLIC API (для MainActivity и других компонентов)
-    // ═══════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════
+    // PUBLIC API
+    // ══════════════════════════════════════════════════════════════════
 
-    /** Возвращает контроллер камеры для прямого доступа */
     fun getCameraController(): CameraController? = cameraController
-
-    /** Проверяет, запущен ли HTTP сервер */
     fun isServerRunning(): Boolean = httpServer?.isAlive == true
-
-    /** Возвращает порт сервера */
-    fun getServerPort(): Int = SERVER_PORT
-
-    /** Возвращает статус здоровья устройства */
+    fun getServerPort(): Int = CameraConfig.SERVER_PORT
     fun getHealthStatus() = healthMonitor?.getHealthStatus()
-
-    /** Возвращает статистику watchdog */
     fun getWatchdogStats() = watchdog?.getStats()
 }

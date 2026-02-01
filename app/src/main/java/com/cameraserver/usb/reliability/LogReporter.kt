@@ -3,6 +3,7 @@ package com.cameraserver.usb.reliability
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import com.cameraserver.usb.config.CameraConfig
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.OutputStreamWriter
@@ -18,30 +19,24 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Отправка логов и алертов на ПК для мониторинга
  *
- * Логи буферизуются и отправляются пачками каждые 10 секунд.
- * При недоступности сервера логи сохраняются в буфере (до 100 записей).
+ * Логи буферизуются и отправляются пачками с заданным интервалом.
+ * При недоступности сервера логи сохраняются в буфере.
  *
- * ## Уровни логов
- * - [info] - информационные сообщения
- * - [warn] - предупреждения
- * - [error] - ошибки
- * - [critical] - критические ошибки (отправляются немедленно)
- *
- * ## Настройка
- * По умолчанию отправляет на http://127.0.0.1:8011/device-logs
- * Изменить через [setReportUrl]
+ * Уровни логов:
+ * - info() - информационные сообщения
+ * - warn() - предупреждения
+ * - error() - ошибки
+ * - critical() - критические ошибки (отправляются немедленно)
  */
 object LogReporter {
 
     private const val TAG = "LogReporter"
 
     @Volatile
-    var reportUrl: String = "http://127.0.0.1:8011/device-logs"
+    var reportUrl: String = CameraConfig.LOG_REPORT_URL
         private set
 
     private val logBuffer = ConcurrentLinkedQueue<LogEntry>()
-    private const val MAX_BUFFER_SIZE = 100
-    private const val SEND_INTERVAL_MS = 10_000L
 
     private val executor = Executors.newSingleThreadScheduledExecutor()
     private val isRunning = AtomicBoolean(false)
@@ -58,7 +53,12 @@ object LogReporter {
         val stackTrace: String? = null
     )
 
-    /** Инициализирует репортер. Вызывается в Application.onCreate */
+    /**
+     * Инициализирует репортер
+     *
+     * @param context контекст приложения
+     * @param pcUrl URL для отправки логов (опционально)
+     */
     fun init(context: Context, pcUrl: String? = null) {
         deviceId = Build.SERIAL ?: Build.ID ?: "unknown"
         deviceModel = "${Build.MANUFACTURER} ${Build.MODEL}"
@@ -68,18 +68,20 @@ object LogReporter {
         if (isRunning.compareAndSet(false, true)) {
             executor.scheduleWithFixedDelay(
                 { sendBufferedLogs() },
-                SEND_INTERVAL_MS,
-                SEND_INTERVAL_MS,
+                CameraConfig.LOG_SEND_INTERVAL_MS,
+                CameraConfig.LOG_SEND_INTERVAL_MS,
                 TimeUnit.MILLISECONDS
             )
-            Log.i(TAG, "LogReporter initialized. URL: $reportUrl")
+            Log.i(TAG, "LogReporter инициализирован. URL: $reportUrl")
         }
     }
 
-    /** Устанавливает URL для отправки логов */
+    /**
+     * Устанавливает URL для отправки логов
+     */
     fun setReportUrl(url: String) {
         reportUrl = url
-        Log.i(TAG, "Report URL changed to: $url")
+        Log.i(TAG, "URL изменён на: $url")
     }
 
     fun info(tag: String, message: String) {
@@ -97,17 +99,21 @@ object LogReporter {
         addToBuffer("ERROR", tag, message, throwable?.stackTraceToString())
     }
 
-    /** Критическая ошибка - отправляется немедленно */
+    /**
+     * Критическая ошибка - отправляется немедленно
+     */
     fun critical(tag: String, message: String, throwable: Throwable? = null) {
-        Log.e(tag, "CRITICAL: $message", throwable)
+        Log.e(tag, "КРИТИЧНО: $message", throwable)
         addToBuffer("CRITICAL", tag, message, throwable?.stackTraceToString())
         executor.submit { sendBufferedLogs() }
     }
 
-    /** Отправляет алерт о попытке восстановления */
+    /**
+     * Отправляет алерт о попытке восстановления
+     */
     fun reportRecoveryAttempt(attempt: Int, strategy: String, success: Boolean) {
-        val status = if (success) "SUCCESS" else "FAILED"
-        val message = "Recovery attempt #$attempt using $strategy: $status"
+        val status = if (success) "УСПЕХ" else "НЕУДАЧА"
+        val message = "Попытка восстановления #$attempt ($strategy): $status"
 
         if (success) {
             info(TAG, message)
@@ -116,10 +122,12 @@ object LogReporter {
         }
     }
 
-    /** Отправляет heartbeat для мониторинга */
+    /**
+     * Отправляет heartbeat для мониторинга
+     */
     fun sendHeartbeat(status: String, details: Map<String, Any> = emptyMap()) {
         executor.submit {
-            try {
+            runCatching {
                 val json = JSONObject().apply {
                     put("type", "heartbeat")
                     put("deviceId", deviceId)
@@ -129,8 +137,6 @@ object LogReporter {
                     put("details", JSONObject(details))
                 }
                 sendToPC(json.toString())
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to send heartbeat", e)
             }
         }
     }
@@ -146,7 +152,7 @@ object LogReporter {
 
         logBuffer.add(entry)
 
-        while (logBuffer.size > MAX_BUFFER_SIZE) {
+        while (logBuffer.size > CameraConfig.LOG_MAX_BUFFER_SIZE) {
             logBuffer.poll()
         }
     }
@@ -155,13 +161,13 @@ object LogReporter {
         if (logBuffer.isEmpty()) return
 
         val logsToSend = mutableListOf<LogEntry>()
-        while (logBuffer.isNotEmpty() && logsToSend.size < 50) {
+        while (logBuffer.isNotEmpty() && logsToSend.size < CameraConfig.LOG_BATCH_SIZE) {
             logBuffer.poll()?.let { logsToSend.add(it) }
         }
 
         if (logsToSend.isEmpty()) return
 
-        try {
+        runCatching {
             val json = JSONObject().apply {
                 put("type", "logs")
                 put("deviceId", deviceId)
@@ -183,35 +189,31 @@ object LogReporter {
             if (!success) {
                 logsToSend.forEach { logBuffer.add(it) }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to send logs", e)
+        }.onFailure {
             logsToSend.forEach { logBuffer.add(it) }
         }
     }
 
     private fun sendToPC(jsonData: String): Boolean {
         var connection: HttpURLConnection? = null
-        return try {
+        return runCatching {
             val url = URL(reportUrl)
             connection = url.openConnection() as HttpURLConnection
-            connection.apply {
+            connection!!.apply {
                 requestMethod = "POST"
                 setRequestProperty("Content-Type", "application/json")
-                connectTimeout = 5000
-                readTimeout = 5000
+                connectTimeout = CameraConfig.LOG_HTTP_CONNECT_TIMEOUT_MS
+                readTimeout = CameraConfig.LOG_HTTP_READ_TIMEOUT_MS
                 doOutput = true
             }
 
-            OutputStreamWriter(connection.outputStream).use { writer ->
+            OutputStreamWriter(connection!!.outputStream).use { writer ->
                 writer.write(jsonData)
                 writer.flush()
             }
 
-            val responseCode = connection.responseCode
-            responseCode in 200..299
-        } catch (_: Exception) {
-            false
-        } finally {
+            connection!!.responseCode in 200..299
+        }.getOrDefault(false).also {
             connection?.disconnect()
         }
     }

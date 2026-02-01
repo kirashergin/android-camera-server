@@ -1,0 +1,6 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<device-owner-context>
+    <device-owner package="com.cameraserver.usb"
+                   name="Camera Server Admin"
+                   component="com.cameraserver.usb/.admin.DeviceAdminReceiver" />
+</device-owner-context>

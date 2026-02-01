@@ -25,6 +25,15 @@ import androidx.core.content.ContextCompat
 import com.cameraserver.usb.admin.DeviceOwnerManager
 import com.cameraserver.usb.config.CameraConfig
 
+/**
+ * Главный экран приложения
+ *
+ * Обеспечивает:
+ * - Запуск/остановку сервиса камеры
+ * - Отображение статуса сервера
+ * - Запрос необходимых разрешений
+ * - Настройку оптимизации батареи
+ */
 class MainActivity : AppCompatActivity() {
 
     companion object {
@@ -46,14 +55,14 @@ class MainActivity : AppCompatActivity() {
             cameraService = binder.getService()
             isBound = true
             updateUI()
-            Log.i(TAG, "Service connected")
+            Log.i(TAG, "Подключён к сервису")
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             cameraService = null
             isBound = false
             updateUI()
-            Log.i(TAG, "Service disconnected")
+            Log.i(TAG, "Отключён от сервиса")
         }
     }
 
@@ -61,7 +70,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Держать экран включенным (для фотобудки)
+        // Держать экран включенным
         window.addFlags(
             WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
             WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
@@ -87,10 +96,8 @@ class MainActivity : AppCompatActivity() {
             stopCameraService()
         }
 
-        // Проверяем и запрашиваем исключение из оптимизации батареи
         checkBatteryOptimization()
 
-        // Автозапуск при наличии разрешений
         if (checkPermissions()) {
             startCameraService()
         } else {
@@ -98,16 +105,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Проверяет и запрашивает исключение из оптимизации батареи
+     */
     @SuppressLint("BatteryLife")
     private fun checkBatteryOptimization() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
             if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
-                // Показываем диалог с объяснением
                 AlertDialog.Builder(this)
-                    .setTitle("Battery Optimization")
+                    .setTitle("Оптимизация батареи")
                     .setMessage(
-                        "Для стабильной работы в режиме фотобудки необходимо отключить оптимизацию батареи.\n\n" +
+                        "Для стабильной работы необходимо отключить оптимизацию батареи.\n\n" +
                         "Это позволит сервису работать непрерывно в фоне."
                     )
                     .setPositiveButton("Настроить") { _, _ ->
@@ -131,23 +140,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkPermissions(): Boolean {
-        val cameraPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-        return cameraPermission == PackageManager.PERMISSION_GRANTED
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
     }
 
     private fun requestPermissions() {
         val permissions = mutableListOf(Manifest.permission.CAMERA)
-        
-        // Android 13+ требует отдельного разрешения для уведомлений
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
-        
-        ActivityCompat.requestPermissions(
-            this,
-            permissions.toTypedArray(),
-            PERMISSION_REQUEST_CODE
-        )
+
+        ActivityCompat.requestPermissions(this, permissions.toTypedArray(), PERMISSION_REQUEST_CODE)
     }
 
     override fun onRequestPermissionsResult(
@@ -156,77 +160,83 @@ class MainActivity : AppCompatActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        
+
         if (requestCode == PERMISSION_REQUEST_CODE) {
-            val cameraGranted = grantResults.isNotEmpty() && 
+            val cameraGranted = grantResults.isNotEmpty() &&
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
-            
+
             if (cameraGranted) {
                 startCameraService()
             } else {
-                Toast.makeText(this, "Camera permission required", Toast.LENGTH_LONG).show()
-                statusText.text = "Camera permission denied"
+                Toast.makeText(this, "Требуется разрешение камеры", Toast.LENGTH_LONG).show()
+                statusText.text = "Разрешение камеры отклонено"
             }
         }
     }
 
+    /**
+     * Запускает сервис камеры
+     */
     private fun startCameraService() {
         val intent = Intent(this, CameraService::class.java).apply {
             action = CameraService.ACTION_START
         }
-        
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
         } else {
             startService(intent)
         }
-        
-        // Bind для получения статуса
+
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
-        
         updateUI()
     }
 
+    /**
+     * Останавливает сервис камеры
+     */
     private fun stopCameraService() {
         if (isBound) {
             unbindService(serviceConnection)
             isBound = false
         }
-        
+
         val intent = Intent(this, CameraService::class.java).apply {
             action = CameraService.ACTION_STOP
         }
         startService(intent)
-        
+
         cameraService = null
         updateUI()
     }
 
+    /**
+     * Обновляет UI на основе текущего состояния
+     */
     private fun updateUI() {
         runOnUiThread {
             val isRunning = cameraService?.isServerRunning() == true
-            val port = cameraService?.getServerPort() ?: CameraService.SERVER_PORT
+            val port = CameraConfig.SERVER_PORT
             val configSummary = CameraConfig.getConfigSummary()
-            val batteryOptimized = if (isBatteryOptimizationDisabled()) "✅ OFF" else "⚠️ ON"
+            val batteryOptimized = if (isBatteryOptimizationDisabled()) "OFF" else "ON"
 
-            // Device Owner статус
             val doStatus = DeviceOwnerManager.getStatus(this)
-            val deviceOwner = if (doStatus.isDeviceOwner) "✅ YES" else "❌ NO"
-            val fgsBackground = if (doStatus.canStartFgsFromBackground) "✅ YES" else "⚠️ NO"
+            val deviceOwner = if (doStatus.isDeviceOwner) "YES" else "NO"
+            val fgsBackground = if (doStatus.canStartFgsFromBackground) "YES" else "NO"
 
             if (isRunning) {
                 statusText.text = """
-                    ══════ SERVER STATUS ══════
-                    Status: ✅ RUNNING
-                    Port: $port
-                    Stream: $configSummary
+                    ══════ СТАТУС СЕРВЕРА ══════
+                    Статус: РАБОТАЕТ
+                    Порт: $port
+                    Стрим: $configSummary
 
                     ══════ DEVICE OWNER ══════
                     Device Owner: $deviceOwner
-                    FGS from Background: $fgsBackground
+                    FGS из фона: $fgsBackground
 
-                    ══════ RELIABILITY ══════
-                    Battery Optimization: $batteryOptimized
+                    ══════ НАДЁЖНОСТЬ ══════
+                    Оптимизация батареи: $batteryOptimized
 
                     ══════ API ENDPOINTS ══════
                     GET  /status | /stream/config
@@ -235,7 +245,7 @@ class MainActivity : AppCompatActivity() {
                     GET  /stream/mjpeg
                     POST /photo | /photo/quick
 
-                    ══════ CONNECT VIA USB ══════
+                    ══════ ПОДКЛЮЧЕНИЕ USB ══════
                     adb forward tcp:$port tcp:$port
                     http://localhost:$port
                 """.trimIndent()
@@ -244,19 +254,19 @@ class MainActivity : AppCompatActivity() {
                 stopButton.isEnabled = true
             } else {
                 statusText.text = """
-                    ══════ SERVER STATUS ══════
-                    Status: ⏹️ STOPPED
-                    Config: $configSummary
+                    ══════ СТАТУС СЕРВЕРА ══════
+                    Статус: ОСТАНОВЛЕН
+                    Конфиг: $configSummary
 
                     ══════ DEVICE OWNER ══════
                     Device Owner: $deviceOwner
-                    FGS from Background: $fgsBackground
+                    FGS из фона: $fgsBackground
 
-                    ══════ RELIABILITY ══════
-                    Battery Optimization: $batteryOptimized
+                    ══════ НАДЁЖНОСТЬ ══════
+                    Оптимизация батареи: $batteryOptimized
 
                     ═══════════════════════════
-                    Press START to begin
+                    Нажмите START для запуска
                 """.trimIndent()
 
                 startButton.isEnabled = true
@@ -267,7 +277,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        // Привязываемся к сервису если он работает
         val intent = Intent(this, CameraService::class.java)
         bindService(intent, serviceConnection, 0)
     }

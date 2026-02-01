@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import com.cameraserver.usb.config.CameraConfig
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -13,35 +14,26 @@ import java.util.concurrent.atomic.AtomicLong
  * Watchdog для мониторинга здоровья системы
  *
  * Отслеживает и реагирует на:
- * - Зависание стрима (нет кадров >10 сек) → [onStreamStuck]
- * - Зависание сервера (нет ответов >2 мин) → [onServerStuck]
- * - Критическое использование памяти (>85%) → [onMemoryWarning]
+ * - Зависание стрима (нет кадров) → onStreamStuck
+ * - Зависание сервера (нет ответов) → onServerStuck
+ * - Критическое использование памяти → onMemoryWarning
  *
- * При 3+ последовательных ошибках вызывает [onCriticalError]
+ * При MAX_CONSECUTIVE_FAILURES последовательных ошибках вызывает onCriticalError
  * для полного перезапуска сервиса.
- *
- * @property context Android Context для системных сервисов
  */
 class SystemWatchdog(private val context: Context) {
-    
+
     companion object {
         private const val TAG = "Watchdog"
-
-        private const val CHECK_INTERVAL_MS = 5000L
-        private const val STREAM_TIMEOUT_MS = 10000L
-        private const val SERVER_TIMEOUT_MS = 30000L
-
-        private const val MAX_CONSECUTIVE_FAILURES = 3
-        private const val MEMORY_WARNING_THRESHOLD = 0.85
-        private const val MEMORY_CRITICAL_THRESHOLD = 0.95
     }
-    
+
     private val handler = Handler(Looper.getMainLooper())
     private val isRunning = AtomicBoolean(false)
 
     private val lastFrameTime = AtomicLong(0)
     private val lastServerResponseTime = AtomicLong(0)
     private val consecutiveFailures = AtomicInteger(0)
+    private val isStreamActive = AtomicBoolean(false)
 
     private var onStreamStuck: (() -> Unit)? = null
     private var onServerStuck: (() -> Unit)? = null
@@ -50,22 +42,24 @@ class SystemWatchdog(private val context: Context) {
 
     private var totalRestarts = 0
     private var lastRestartTime = 0L
-    
+
     private val checkRunnable = object : Runnable {
         override fun run() {
             if (!isRunning.get()) return
-            
+
             try {
                 performHealthCheck()
             } catch (e: Exception) {
-                Log.e(TAG, "Health check error", e)
+                Log.e(TAG, "Ошибка проверки здоровья", e)
             }
-            
-            handler.postDelayed(this, CHECK_INTERVAL_MS)
+
+            handler.postDelayed(this, CameraConfig.WATCHDOG_CHECK_INTERVAL_MS)
         }
     }
-    
-    /** Запускает watchdog с указанными callbacks */
+
+    /**
+     * Запускает watchdog с указанными callbacks
+     */
     fun start(
         onStreamStuck: () -> Unit,
         onServerStuck: () -> Unit,
@@ -76,23 +70,25 @@ class SystemWatchdog(private val context: Context) {
         this.onServerStuck = onServerStuck
         this.onCriticalError = onCriticalError
         this.onMemoryWarning = onMemoryWarning
-        
+
         isRunning.set(true)
         resetTimestamps()
         handler.post(checkRunnable)
-        Log.i(TAG, "Watchdog started")
+        Log.i(TAG, "Watchdog запущен")
     }
-    
-    /** Останавливает watchdog */
+
+    /**
+     * Останавливает watchdog
+     */
     fun stop() {
         isRunning.set(false)
         handler.removeCallbacks(checkRunnable)
-        Log.i(TAG, "Watchdog stopped")
+        Log.i(TAG, "Watchdog остановлен")
     }
-    
-    private val isStreamActive = AtomicBoolean(false)
 
-    /** Вызывается при получении нового кадра */
+    /**
+     * Вызывается при получении нового кадра
+     */
     fun reportFrameReceived() {
         lastFrameTime.set(SystemClock.elapsedRealtime())
         isStreamActive.set(true)
@@ -101,82 +97,90 @@ class SystemWatchdog(private val context: Context) {
         }
     }
 
-    /** Вызывается при остановке стрима */
+    /**
+     * Вызывается при остановке стрима
+     */
     fun reportStreamStopped() {
         isStreamActive.set(false)
     }
 
-    /** Вызывается при успешном HTTP запросе */
+    /**
+     * Вызывается при успешном HTTP запросе
+     */
     fun reportServerResponse() {
         lastServerResponseTime.set(SystemClock.elapsedRealtime())
     }
 
-    /** Сбрасывает временные метки (при старте/рестарте) */
+    /**
+     * Сбрасывает временные метки (при старте/рестарте)
+     */
     fun resetTimestamps() {
         val now = SystemClock.elapsedRealtime()
         lastFrameTime.set(now)
         lastServerResponseTime.set(now)
         consecutiveFailures.set(0)
     }
-    
+
     private fun performHealthCheck() {
         val now = SystemClock.elapsedRealtime()
 
         checkMemory()
 
+        // Проверка стрима (динамический таймаут на основе FPS)
         if (isStreamActive.get()) {
             val frameAge = now - lastFrameTime.get()
-            if (frameAge > STREAM_TIMEOUT_MS) {
-                Log.w(TAG, "Stream stuck (no frames for ${frameAge}ms)")
+            val timeout = CameraConfig.watchdogStreamTimeoutMs
+            if (frameAge > timeout) {
+                Log.w(TAG, "Стрим завис (нет кадров ${frameAge}мс, таймаут: ${timeout}мс @ ${CameraConfig.targetFps}fps)")
                 handleFailure("stream_stuck") { onStreamStuck?.invoke() }
             }
         }
 
-        // Проверка сервера (2 мин) - нормально если нет клиентов
+        // Проверка сервера
         val serverAge = now - lastServerResponseTime.get()
-        if (serverAge > SERVER_TIMEOUT_MS * 4) {
-            Log.w(TAG, "Server stuck (no response for ${serverAge}ms)")
+        if (serverAge > CameraConfig.WATCHDOG_SERVER_TIMEOUT_MS * CameraConfig.WATCHDOG_SERVER_TIMEOUT_MULTIPLIER) {
+            Log.w(TAG, "Сервер завис (нет ответов ${serverAge}мс)")
             handleFailure("server_stuck") { onServerStuck?.invoke() }
         }
     }
-    
+
     private fun checkMemory() {
         val runtime = Runtime.getRuntime()
         val usedMemory = runtime.totalMemory() - runtime.freeMemory()
         val maxMemory = runtime.maxMemory()
         val memoryUsage = usedMemory.toFloat() / maxMemory
-        
+
         when {
-            memoryUsage > MEMORY_CRITICAL_THRESHOLD -> {
-                Log.e(TAG, "CRITICAL: Memory usage at ${(memoryUsage * 100).toInt()}%")
-                // Принудительный GC
+            memoryUsage > CameraConfig.WATCHDOG_MEMORY_CRITICAL_THRESHOLD -> {
+                Log.e(TAG, "КРИТИЧНО: Память ${(memoryUsage * 100).toInt()}%")
                 System.gc()
                 onMemoryWarning?.invoke(memoryUsage)
             }
-            memoryUsage > MEMORY_WARNING_THRESHOLD -> {
-                Log.w(TAG, "WARNING: Memory usage at ${(memoryUsage * 100).toInt()}%")
+            memoryUsage > CameraConfig.WATCHDOG_MEMORY_WARNING_THRESHOLD -> {
+                Log.w(TAG, "ВНИМАНИЕ: Память ${(memoryUsage * 100).toInt()}%")
                 onMemoryWarning?.invoke(memoryUsage)
             }
         }
     }
-    
+
     private fun handleFailure(type: String, recoveryAction: () -> Unit) {
         val failures = consecutiveFailures.incrementAndGet()
-        Log.w(TAG, "Failure detected: $type (consecutive: $failures)")
-        
-        if (failures >= MAX_CONSECUTIVE_FAILURES) {
-            Log.e(TAG, "Too many consecutive failures, triggering critical error handler")
+        Log.w(TAG, "Обнаружена ошибка: $type (подряд: $failures)")
+
+        if (failures >= CameraConfig.WATCHDOG_MAX_CONSECUTIVE_FAILURES) {
+            Log.e(TAG, "Слишком много ошибок подряд, запуск критического обработчика")
             consecutiveFailures.set(0)
             totalRestarts++
             lastRestartTime = System.currentTimeMillis()
             onCriticalError?.invoke()
         } else {
-            // Пытаемся мягко восстановить
             recoveryAction()
         }
     }
-    
-    /** Возвращает статистику для отладки */
+
+    /**
+     * Возвращает статистику для отладки
+     */
     fun getStats(): WatchdogStats {
         val now = SystemClock.elapsedRealtime()
         return WatchdogStats(
@@ -190,6 +194,9 @@ class SystemWatchdog(private val context: Context) {
     }
 }
 
+/**
+ * Статистика watchdog
+ */
 data class WatchdogStats(
     val isRunning: Boolean,
     val lastFrameAgeMs: Long,

@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
 import android.util.Log
+import com.cameraserver.usb.config.CameraConfig
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -13,34 +14,22 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Мониторинг состояния устройства
  *
  * Отслеживает температуру батареи, уровень заряда и температуру CPU.
- * При критических значениях вызывает callbacks для реакции.
+ * При критических значениях вызывает callbacks для реакции приложения.
  *
- * ## Пороги температуры
- * - 40°C - WARNING (предупреждение)
- * - 45°C - HIGH (высокая)
- * - 50°C - CRITICAL (критическая)
- *
- * ## Пороги батареи
- * - 15% - LOW (низкий)
- * - 5% - CRITICAL (критический)
+ * Пороги температуры задаются в CameraConfig:
+ * - TEMP_WARNING (40°C) - предупреждение
+ * - TEMP_HIGH (45°C) - высокая температура
+ * - TEMP_CRITICAL (50°C) - критическая температура
  */
 class DeviceHealthMonitor(private val context: Context) {
-    
+
     companion object {
         private const val TAG = "DeviceHealth"
-
-        // Температура в десятых градуса (400 = 40.0°C)
-        private const val TEMP_WARNING = 400
-        private const val TEMP_HIGH = 450
-        private const val TEMP_CRITICAL = 500
-
-        private const val BATTERY_LOW = 15
-        private const val BATTERY_CRITICAL = 5
     }
-    
+
     private var batteryReceiver: BroadcastReceiver? = null
     private val isMonitoring = AtomicBoolean(false)
-    
+
     @Volatile var currentTemperature: Int = 0
         private set
     @Volatile var currentBatteryLevel: Int = 100
@@ -52,105 +41,104 @@ class DeviceHealthMonitor(private val context: Context) {
 
     private var onTemperatureWarning: ((Int, TemperatureLevel) -> Unit)? = null
     private var onBatteryLow: ((Int) -> Unit)? = null
-    
+
     enum class TemperatureLevel {
-        NORMAL,
-        WARNING,
-        HIGH,
-        CRITICAL
+        NORMAL, WARNING, HIGH, CRITICAL
     }
-    
-    /** Запускает мониторинг температуры и батареи */
+
+    /**
+     * Запускает мониторинг температуры и батареи
+     */
     fun startMonitoring(
         onTemperatureWarning: (Int, TemperatureLevel) -> Unit = { _, _ -> },
         onBatteryLow: (Int) -> Unit = {}
     ) {
         if (isMonitoring.get()) return
-        
+
         this.onTemperatureWarning = onTemperatureWarning
         this.onBatteryLow = onBatteryLow
-        
+
         batteryReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 processBatteryIntent(intent)
             }
         }
-        
+
         val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
         context.registerReceiver(batteryReceiver, filter)
         isMonitoring.set(true)
-        
-        Log.i(TAG, "Device health monitoring started")
+
+        Log.i(TAG, "Мониторинг здоровья устройства запущен")
     }
-    
-    /** Останавливает мониторинг */
+
+    /**
+     * Останавливает мониторинг
+     */
     fun stopMonitoring() {
         if (!isMonitoring.get()) return
-        
+
         batteryReceiver?.let {
-            try {
-                context.unregisterReceiver(it)
-            } catch (e: Exception) {
-                Log.w(TAG, "Error unregistering receiver", e)
-            }
+            runCatching { context.unregisterReceiver(it) }
         }
         batteryReceiver = null
         isMonitoring.set(false)
-        
-        Log.i(TAG, "Device health monitoring stopped")
+
+        Log.i(TAG, "Мониторинг здоровья устройства остановлен")
     }
-    
+
     private fun processBatteryIntent(intent: Intent) {
-        // Температура
+        // Температура батареи
         val temp = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0)
         currentTemperature = temp
         checkTemperature(temp)
-        
+
         // Уровень заряда
         val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
         currentBatteryLevel = if (scale > 0) (level * 100 / scale) else level
         checkBattery(currentBatteryLevel)
-        
+
         // Статус зарядки
         val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
         isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-                     status == BatteryManager.BATTERY_STATUS_FULL
-        
+                status == BatteryManager.BATTERY_STATUS_FULL
+
         // CPU температура (опционально)
         cpuTemperature = readCpuTemperature()
     }
-    
+
     private fun checkTemperature(temp: Int) {
         val level = when {
-            temp >= TEMP_CRITICAL -> TemperatureLevel.CRITICAL
-            temp >= TEMP_HIGH -> TemperatureLevel.HIGH
-            temp >= TEMP_WARNING -> TemperatureLevel.WARNING
+            temp >= CameraConfig.TEMP_CRITICAL -> TemperatureLevel.CRITICAL
+            temp >= CameraConfig.TEMP_HIGH -> TemperatureLevel.HIGH
+            temp >= CameraConfig.TEMP_WARNING -> TemperatureLevel.WARNING
             else -> TemperatureLevel.NORMAL
         }
-        
+
         if (level != TemperatureLevel.NORMAL) {
-            Log.w(TAG, "Temperature ${level.name}: ${temp / 10.0}°C")
+            Log.w(TAG, "Температура ${level.name}: ${temp / 10.0}°C")
             onTemperatureWarning?.invoke(temp, level)
         }
     }
-    
+
     private fun checkBattery(level: Int) {
         if (!isCharging) {
             when {
-                level <= BATTERY_CRITICAL -> {
-                    Log.e(TAG, "CRITICAL battery level: $level%")
+                level <= CameraConfig.BATTERY_CRITICAL -> {
+                    Log.e(TAG, "КРИТИЧЕСКИЙ уровень батареи: $level%")
                     onBatteryLow?.invoke(level)
                 }
-                level <= BATTERY_LOW -> {
-                    Log.w(TAG, "Low battery level: $level%")
+                level <= CameraConfig.BATTERY_LOW -> {
+                    Log.w(TAG, "Низкий уровень батареи: $level%")
                     onBatteryLow?.invoke(level)
                 }
             }
         }
     }
-    
-    /** Читает температуру CPU из системных файлов (если доступно) */
+
+    /**
+     * Читает температуру CPU из системных файлов
+     */
     private fun readCpuTemperature(): Float {
         val paths = listOf(
             "/sys/class/thermal/thermal_zone0/temp",
@@ -158,18 +146,20 @@ class DeviceHealthMonitor(private val context: Context) {
         )
 
         for (path in paths) {
-            try {
+            runCatching {
                 val file = File(path)
                 if (file.exists()) {
-                    val temp = file.readText().trim().toFloatOrNull() ?: continue
+                    val temp = file.readText().trim().toFloatOrNull() ?: return@runCatching
                     return if (temp > 1000) temp / 1000 else temp
                 }
-            } catch (_: Exception) { }
+            }
         }
         return 0f
     }
 
-    /** Возвращает текущий статус здоровья устройства */
+    /**
+     * Возвращает текущий статус здоровья устройства
+     */
     fun getHealthStatus(): DeviceHealthStatus {
         return DeviceHealthStatus(
             batteryLevel = currentBatteryLevel,
@@ -177,29 +167,40 @@ class DeviceHealthMonitor(private val context: Context) {
             cpuTemperature = cpuTemperature,
             isCharging = isCharging,
             temperatureLevel = when {
-                currentTemperature >= TEMP_CRITICAL -> TemperatureLevel.CRITICAL
-                currentTemperature >= TEMP_HIGH -> TemperatureLevel.HIGH
-                currentTemperature >= TEMP_WARNING -> TemperatureLevel.WARNING
+                currentTemperature >= CameraConfig.TEMP_CRITICAL -> TemperatureLevel.CRITICAL
+                currentTemperature >= CameraConfig.TEMP_HIGH -> TemperatureLevel.HIGH
+                currentTemperature >= CameraConfig.TEMP_WARNING -> TemperatureLevel.WARNING
                 else -> TemperatureLevel.NORMAL
             }
         )
     }
-    
-    /** Рекомендуемое снижение качества (0.0-0.75) на основе состояния */
+
+    /**
+     * Рекомендуемое снижение качества на основе состояния устройства
+     *
+     * @return коэффициент снижения (0.0-QUALITY_REDUCTION_MAX)
+     */
     fun getRecommendedQualityReduction(): Float {
         val tempReduction = when {
-            currentTemperature >= TEMP_CRITICAL -> 0.5f  // Снизить на 50%
-            currentTemperature >= TEMP_HIGH -> 0.25f     // Снизить на 25%
-            currentTemperature >= TEMP_WARNING -> 0.1f   // Снизить на 10%
+            currentTemperature >= CameraConfig.TEMP_CRITICAL -> CameraConfig.QUALITY_REDUCTION_TEMP_CRITICAL
+            currentTemperature >= CameraConfig.TEMP_HIGH -> CameraConfig.QUALITY_REDUCTION_TEMP_HIGH
+            currentTemperature >= CameraConfig.TEMP_WARNING -> CameraConfig.QUALITY_REDUCTION_TEMP_WARNING
             else -> 0f
         }
-        
-        val batteryReduction = if (!isCharging && currentBatteryLevel < BATTERY_LOW) 0.25f else 0f
-        
-        return (tempReduction + batteryReduction).coerceAtMost(0.75f)
+
+        val batteryReduction = if (!isCharging && currentBatteryLevel < CameraConfig.BATTERY_LOW) {
+            CameraConfig.QUALITY_REDUCTION_BATTERY_LOW
+        } else {
+            0f
+        }
+
+        return (tempReduction + batteryReduction).coerceAtMost(CameraConfig.QUALITY_REDUCTION_MAX)
     }
 }
 
+/**
+ * Статус здоровья устройства
+ */
 data class DeviceHealthStatus(
     val batteryLevel: Int,
     val batteryTemperature: Float,
