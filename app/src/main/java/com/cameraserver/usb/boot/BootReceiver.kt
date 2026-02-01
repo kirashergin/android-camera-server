@@ -1,10 +1,13 @@
 package com.cameraserver.usb.boot
 
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.cameraserver.usb.CameraService
 import com.cameraserver.usb.admin.DeviceOwnerManager
 import com.cameraserver.usb.reliability.LogReporter
@@ -46,6 +49,18 @@ class BootReceiver : BroadcastReceiver() {
      * Запускает сервис камеры в зависимости от возможностей
      */
     private fun startCameraService(context: Context) {
+        // Проверяем разрешение камеры
+        val hasCameraPermission = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+
+        if (!hasCameraPermission) {
+            LogReporter.warn(TAG, "Нет разрешения CAMERA, запускаем Activity для запроса")
+            launchMainActivity(context)
+            return
+        }
+
         val isDeviceOwner = DeviceOwnerManager.isDeviceOwner(context)
         val canStartFromBackground = DeviceOwnerManager.canStartForegroundServiceFromBackground(context)
 

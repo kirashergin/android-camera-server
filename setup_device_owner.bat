@@ -34,7 +34,7 @@ if errorlevel 1 (
 
 echo.
 echo Setting Device Owner...
-adb shell dpm set-device-owner com.cameraserver.usb/.admin.DeviceAdminReceiver
+adb shell dpm set-device-owner com.cameraserver.usb/.admin.CameraDeviceAdminReceiver
 
 echo.
 echo Checking status...

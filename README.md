@@ -101,11 +101,17 @@ setup_device_owner.bat
 
 **Ручная установка:**
 ```bash
-# Установить приложение
+# 1. Установить приложение
 adb install app-release.apk
 
-# Назначить Device Owner
-adb shell dpm set-device-owner com.cameraserver.usb/.admin.DeviceAdminReceiver
+# 2. Запустить приложение и дать разрешения (ВАЖНО!)
+# Откройте приложение на устройстве и разрешите доступ к камере
+
+# 3. Назначить Device Owner
+adb shell dpm set-device-owner com.cameraserver.usb/.admin.CameraDeviceAdminReceiver
+
+# 4. Дать разрешение CAMERA через ADB (если не дали через UI)
+adb shell pm grant com.cameraserver.usb android.permission.CAMERA
 ```
 
 **Проверка установки:**

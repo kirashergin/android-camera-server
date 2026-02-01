@@ -10,6 +10,11 @@ adb shell dumpsys device_policy | findstr /C:"Device Owner" /C:"admin=" /C:"pack
 echo.
 echo ========================================
 
+echo.
+echo Checking camera permission...
+adb shell dumpsys package com.cameraserver.usb | findstr "CAMERA: granted=true"
+
+echo.
 echo Checking via app endpoint...
 curl http://localhost:8080/device-owner 2>nul
 if errorlevel 1 (
