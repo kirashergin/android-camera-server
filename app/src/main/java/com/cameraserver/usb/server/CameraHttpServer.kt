@@ -63,7 +63,7 @@ class CameraHttpServer(
             }
         }
 
-        return try {
+        val response = try {
             when {
                 session.uri == "/" || session.uri == "/settings" -> handleWebUI()
                 session.uri == "/favicon.ico" -> handleFavicon()
@@ -85,6 +85,13 @@ class CameraHttpServer(
             Log.e(TAG, "Ошибка обработки ${session.method} ${session.uri}: ${e.message}", e)
             errorResponse("${e.javaClass.simpleName}: ${e.message ?: "Unknown error"}")
         }
+
+        // CORS заголовки для всех ответов
+        response.addHeader("Access-Control-Allow-Origin", "*")
+        response.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        response.addHeader("Access-Control-Allow-Headers", "Content-Type")
+
+        return response
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -505,9 +512,7 @@ init();
             "image/jpeg",
             ByteArrayInputStream(frame),
             frame.size.toLong()
-        ).apply {
-            addHeader("Access-Control-Allow-Origin", "*")
-        }
+        )
     }
 
     /**
@@ -642,7 +647,6 @@ init();
                     }.toString()
                 ).apply {
                     addHeader("Retry-After", "2")
-                    addHeader("Access-Control-Allow-Origin", "*")
                 }
             }
 
@@ -653,7 +657,6 @@ init();
                 data.size.toLong()
             ).apply {
                 addHeader("Content-Disposition", "attachment; filename=\"photo_${System.currentTimeMillis()}.jpg\"")
-                addHeader("Access-Control-Allow-Origin", "*")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Ошибка захвата фото: ${e.message}", e)
@@ -676,7 +679,6 @@ init();
                 data.size.toLong()
             ).apply {
                 addHeader("Content-Disposition", "attachment; filename=\"quick_${System.currentTimeMillis()}.jpg\"")
-                addHeader("Access-Control-Allow-Origin", "*")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Ошибка быстрого фото: ${e.message}", e)
@@ -750,9 +752,7 @@ init();
     }
 
     private fun jsonResponse(json: JSONObject, status: Response.Status = Response.Status.OK) =
-        newFixedLengthResponse(status, "application/json", json.toString()).apply {
-            addHeader("Access-Control-Allow-Origin", "*")
-        }
+        newFixedLengthResponse(status, "application/json", json.toString())
 
     private fun errorResponse(msg: String, status: Response.Status = Response.Status.BAD_REQUEST) =
         jsonResponse(JSONObject().put("success", false).put("error", msg), status)
