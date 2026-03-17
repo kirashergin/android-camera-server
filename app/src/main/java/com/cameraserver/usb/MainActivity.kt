@@ -20,6 +20,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import java.net.NetworkInterface
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.cameraserver.usb.admin.DeviceOwnerManager
@@ -223,13 +224,29 @@ class MainActivity : AppCompatActivity() {
             val doStatus = DeviceOwnerManager.getStatus(this)
             val deviceOwner = if (doStatus.isDeviceOwner) "YES" else "NO"
             val fgsBackground = if (doStatus.canStartFgsFromBackground) "YES" else "NO"
+            val localIp = getLocalIpAddress()
 
             if (isRunning) {
+                val networkSection = if (localIp != null) {
+                    """
+                    ══════ СЕТЬ ══════
+                    IP: $localIp
+                    http://$localIp:$port
+                    """.trimIndent()
+                } else {
+                    """
+                    ══════ СЕТЬ ══════
+                    Wi-Fi не подключён
+                    """.trimIndent()
+                }
+
                 statusText.text = """
                     ══════ СТАТУС СЕРВЕРА ══════
                     Статус: РАБОТАЕТ
                     Порт: $port
                     Стрим: $configSummary
+
+                    $networkSection
 
                     ══════ DEVICE OWNER ══════
                     Device Owner: $deviceOwner
@@ -253,10 +270,24 @@ class MainActivity : AppCompatActivity() {
                 startButton.isEnabled = false
                 stopButton.isEnabled = true
             } else {
+                val networkSectionStopped = if (localIp != null) {
+                    """
+                    ══════ СЕТЬ ══════
+                    IP: $localIp
+                    """.trimIndent()
+                } else {
+                    """
+                    ══════ СЕТЬ ══════
+                    Wi-Fi не подключён
+                    """.trimIndent()
+                }
+
                 statusText.text = """
                     ══════ СТАТУС СЕРВЕРА ══════
                     Статус: ОСТАНОВЛЕН
                     Конфиг: $configSummary
+
+                    $networkSectionStopped
 
                     ══════ DEVICE OWNER ══════
                     Device Owner: $deviceOwner
@@ -273,6 +304,27 @@ class MainActivity : AppCompatActivity() {
                 stopButton.isEnabled = false
             }
         }
+    }
+
+    /**
+     * Получает IP-адрес устройства в локальной сети
+     */
+    private fun getLocalIpAddress(): String? {
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+            for (intf in interfaces) {
+                if (intf.isLoopback || !intf.isUp) continue
+                for (addr in intf.inetAddresses) {
+                    if (addr.isLoopbackAddress) continue
+                    val ip = addr.hostAddress ?: continue
+                    // IPv4 only
+                    if (ip.contains('.') && !ip.contains(':')) return ip
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Ошибка получения IP: ${e.message}")
+        }
+        return null
     }
 
     override fun onStart() {
